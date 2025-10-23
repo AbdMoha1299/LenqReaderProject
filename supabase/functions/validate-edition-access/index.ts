@@ -110,8 +110,11 @@ Deno.serve(async (req: Request) => {
     let suspiciousActivity = false;
     let suspiciousReason = "";
 
-    if (tokenData.device_fingerprint && deviceFingerprint) {
-      if (tokenData.device_fingerprint !== JSON.stringify(deviceFingerprint)) {
+    if (tokenData.first_access_at && deviceFingerprint) {
+      const storedFingerprint = tokenData.device_fingerprint;
+      const currentFingerprint = JSON.stringify(deviceFingerprint);
+
+      if (storedFingerprint && storedFingerprint !== currentFingerprint) {
         suspiciousActivity = true;
         suspiciousReason = "Device différent détecté";
 
@@ -119,10 +122,10 @@ Deno.serve(async (req: Request) => {
           user_id: tokenData.user_id,
           token_id: tokenData.id,
           type_alerte: "device_multiple",
-          description: `Tentative d'accès depuis un device différent. Original: ${tokenData.device_fingerprint}, Nouveau: ${JSON.stringify(deviceFingerprint)}`,
+          description: `Tentative d'accès depuis un device différent. Original: ${storedFingerprint}, Nouveau: ${currentFingerprint}`,
           severity: "critical",
           data: {
-            original_device: tokenData.device_fingerprint,
+            original_device: storedFingerprint,
             new_device: deviceFingerprint,
             ip_address: ipAddress,
           },
@@ -139,7 +142,7 @@ Deno.serve(async (req: Request) => {
         return new Response(
           JSON.stringify({
             error: "Accès refusé",
-            reason: "Ce lien ne peut être ouvert que sur le device d'origine. Partage de lien détecté et signalé."
+            reason: "Ce lien ne peut être ouvert que sur l'appareil d'origine. Le lien a été désactivé pour des raisons de sécurité."
           }),
           { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
