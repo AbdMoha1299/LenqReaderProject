@@ -1,248 +1,119 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { createClient } from "npm:@supabase/supabase-js@2";
+import { createClient } from "npm:@supabase/supabase-js@2.57.4";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
-const IPAY_API_URL = "https://i-pay.money/api/v1/payments";
-const IPAY_SECRET_KEY = "sk_11a35c3f7ab44dc79e38757fcd28ba82";
+const IPAY_PUBLIC_KEY = Deno.env.get("IPAY_PUBLIC_KEY") ?? "pk_0ac56b86849d4fdca1e44df11a7328e0";
 
-type PaymentType = 'mobile' | 'card' | 'sta';
-
-interface PaymentRequest {
-  customer_name: string;
-  currency: string;
-  country: string;
-  amount: number;
-  transaction_id: string;
-  msisdn?: string;
-  payment_type: PaymentType;
-  user_id?: string;
-  abonnement_id?: string;
+interface InitiatePaymentRequest {
+  user_id: string;
+  formule_id: string;
+  country_code?: string;
+  currency?: string;
+  phone_number?: string;
 }
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
-    return new Response(null, {
-      status: 200,
-      headers: corsHeaders,
-    });
+    return new Response(null, { status: 200, headers: corsHeaders });
+  }
+
+  if (req.method !== "POST") {
+    return new Response(
+      JSON.stringify({ error: "Method not allowed" }),
+      { status: 405, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
   }
 
   try {
-    const requestBody: PaymentRequest = await req.json();
-    const { customer_name, currency, country, amount, transaction_id, msisdn, payment_type, user_id, abonnement_id } = requestBody;
+    const supabaseClient = createClient(
+      Deno.env.get("SUPABASE_URL") ?? "",
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
+    );
 
-    if (!customer_name || !currency || !country || !amount || !transaction_id || !payment_type) {
+    // Obtenir l'utilisateur authentifié
+    const authHeader = req.headers.get("Authorization");
+    if (!authHeader) {
       return new Response(
-        JSON.stringify({
-          success: false,
-          error: "missing_fields",
-          message: "Tous les champs requis doivent être fournis"
-        }),
-        {
-          status: 400,
-          headers: {
-            ...corsHeaders,
-            "Content-Type": "application/json",
-          },
-        }
+        JSON.stringify({ error: "Authentification requise" }),
+        { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
-    if ((payment_type === 'mobile' || payment_type === 'sta') && !msisdn) {
+    const token = authHeader.replace("Bearer ", "");
+    const { data: { user }, error: authError } = await supabaseClient.auth.getUser(token);
+
+    if (authError || !user) {
       return new Response(
-        JSON.stringify({
-          success: false,
-          error: "msisdn_required",
-          message: "Le numéro de téléphone est requis pour ce mode de paiement"
-        }),
-        {
-          status: 400,
-          headers: {
-            ...corsHeaders,
-            "Content-Type": "application/json",
-          },
-        }
+        JSON.stringify({ error: "Utilisateur non authentifié" }),
+        { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
-    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-    const supabase = createClient(supabaseUrl, supabaseKey);
+    const requestData: InitiatePaymentRequest = await req.json();
 
-    const startTime = Date.now();
+    // Vérifier que l'utilisateur initie son propre paiement
+    if (requestData.user_id !== user.id) {
+      return new Response(
+        JSON.stringify({ error: "Vous ne pouvez initier que vos propres paiements" }),
+        { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
 
-    const paymentBody: Record<string, string> = {
-      customer_name,
-      currency,
-      country,
-      amount: amount.toString(),
-      transaction_id,
+    // Initier l'abonnement et le paiement via RPC
+    const { data: initResult, error: initError } = await supabaseClient.rpc(
+      "initiate_subscription_payment",
+      {
+        p_user_id: requestData.user_id,
+        p_formule_id: requestData.formule_id,
+        p_country_code: requestData.country_code ?? "SN",
+        p_currency: requestData.currency ?? "XOF",
+      }
+    );
+
+    if (initError) {
+      console.error("Error initiating payment:", initError);
+      throw initError;
+    }
+
+    console.log("Payment initiated:", initResult);
+
+    // Construire la configuration iPay pour le frontend
+    const ipayConfig = {
+      publicKey: IPAY_PUBLIC_KEY,
+      amount: initResult.amount,
+      currency: initResult.currency,
+      transactionId: initResult.transaction_ref,
+      environment: "live",
+      redirectUrl: `${req.headers.get("origin") ?? ""}/payment-status?ref=${initResult.transaction_ref}`,
+      callbackUrl: `${Deno.env.get("SUPABASE_URL")}/functions/v1/ipay-webhook`,
+      metadata: {
+        user_id: requestData.user_id,
+        formule_id: requestData.formule_id,
+        payment_id: initResult.payment_id,
+        subscription_id: initResult.subscription_id,
+      },
     };
-
-    if (msisdn) {
-      paymentBody.msisdn = msisdn;
-    }
-
-    console.log("📤 Sending to iPay:", {
-      url: IPAY_API_URL,
-      headers: {
-        "Ipay-Payment-Type": payment_type,
-        "Ipay-Target-Environment": "live",
-      },
-      body: paymentBody,
-    });
-
-    const ipayResponse = await fetch(IPAY_API_URL, {
-      method: "POST",
-      headers: {
-        "Ipay-Payment-Type": payment_type,
-        "Ipay-Target-Environment": "live",
-        "Authorization": `Bearer ${IPAY_SECRET_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(paymentBody),
-    });
-
-    const responseTime = Date.now() - startTime;
-    const responseData = await ipayResponse.json();
-
-    console.log("📥 iPay Response:", {
-      status: ipayResponse.status,
-      ok: ipayResponse.ok,
-      data: responseData,
-    });
-
-    let paiementId: string | null = null;
-
-    if (user_id) {
-      const paiementData: any = {
-        user_id,
-        abonnement_id,
-        montant_fcfa: amount,
-        methode_paiement: `iPayMoney-${payment_type}`,
-        ipay_transaction_id: transaction_id,
-        ipay_reference: responseData.reference || null,
-        ipay_status: responseData.status || null,
-        country_code: country,
-        currency,
-        statut: ipayResponse.ok ? "en_attente" : "echoue",
-        notes: `Payment via iPayMoney (${payment_type}) - ${responseData.status || 'initiated'}`,
-      };
-
-      if (msisdn) {
-        paiementData.msisdn = msisdn;
-      }
-
-      const { data: paiement, error: paiementError } = await supabase
-        .from("paiements")
-        .insert(paiementData)
-        .select()
-        .single();
-
-      if (!paiementError && paiement) {
-        paiementId = paiement.id;
-      }
-    }
-
-    await supabase.from("payment_api_logs").insert({
-      paiement_id: paiementId,
-      request_type: "initiate",
-      request_url: IPAY_API_URL,
-      request_headers: {
-        "Ipay-Payment-Type": payment_type,
-        "Ipay-Target-Environment": "live",
-      },
-      request_body: paymentBody,
-      response_status: ipayResponse.status,
-      response_body: responseData,
-      response_time_ms: responseTime,
-      error_message: !ipayResponse.ok ? JSON.stringify(responseData) : null,
-    });
-
-    if (!ipayResponse.ok) {
-      let errorMessage = "Erreur lors de l'initiation du paiement";
-
-      if (ipayResponse.status === 400) {
-        if (responseData.message?.includes("Not Allowed Payment Type")) {
-          errorMessage = "Service de paiement mobile temporairement indisponible. Veuillez réessayer plus tard.";
-        } else if (responseData.message?.includes("invalid")) {
-          errorMessage = "Numéro de téléphone invalide ou paramètres incorrects";
-        } else {
-          errorMessage = responseData.message || "Numéro de téléphone invalide ou paramètres incorrects";
-        }
-      } else if (ipayResponse.status === 401) {
-        errorMessage = "Erreur d'authentification du service de paiement";
-      } else if (ipayResponse.status === 422) {
-        errorMessage = "Référence de transaction invalide";
-      }
-
-      return new Response(
-        JSON.stringify({
-          success: false,
-          error: "payment_failed",
-          message: errorMessage,
-          details: responseData,
-        }),
-        {
-          status: ipayResponse.status,
-          headers: {
-            ...corsHeaders,
-            "Content-Type": "application/json",
-          },
-        }
-      );
-    }
-
-    if (paiementId && responseData.reference) {
-      const nextPollAt = new Date(Date.now() + 10000);
-
-      await supabase.from("payment_polling_jobs").insert({
-        paiement_id: paiementId,
-        ipay_reference: responseData.reference,
-        status: "active",
-        polling_count: 0,
-        next_poll_at: nextPollAt.toISOString(),
-        last_known_status: responseData.status,
-      });
-    }
 
     return new Response(
       JSON.stringify({
         success: true,
-        status: responseData.status,
-        reference: responseData.reference,
-        message: "Paiement initié avec succès",
-        paiement_id: paiementId,
-        payment_url: responseData.payment_url || responseData.redirect_url || null,
+        payment: initResult,
+        ipay_config: ipayConfig,
       }),
-      {
-        status: 200,
-        headers: {
-          ...corsHeaders,
-          "Content-Type": "application/json",
-        },
-      }
+      { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   } catch (error) {
-    console.error("Error in initiate-payment function:", error);
+    console.error("Error initiating payment:", error);
     return new Response(
       JSON.stringify({
-        success: false,
-        error: "internal_error",
-        message: error instanceof Error ? error.message : "Erreur interne du serveur",
+        error: error instanceof Error ? error.message : "Erreur inconnue",
       }),
-      {
-        status: 500,
-        headers: {
-          ...corsHeaders,
-          "Content-Type": "application/json",
-        },
-      }
+      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   }
 });
