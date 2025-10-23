@@ -110,49 +110,10 @@ Deno.serve(async (req: Request) => {
     let suspiciousActivity = false;
     let suspiciousReason = "";
 
-    if (tokenData.first_access_at && deviceFingerprint) {
-      const storedFingerprint = tokenData.device_fingerprint;
-      const currentFingerprint = JSON.stringify(deviceFingerprint);
-
-      if (storedFingerprint && storedFingerprint !== currentFingerprint) {
-        suspiciousActivity = true;
-        suspiciousReason = "Device différent détecté";
-
-        await supabaseClient.from("acces_suspects").insert({
-          user_id: tokenData.user_id,
-          token_id: tokenData.id,
-          type_alerte: "device_multiple",
-          description: `Tentative d'accès depuis un device différent. Original: ${storedFingerprint}, Nouveau: ${currentFingerprint}`,
-          severity: "critical",
-          data: {
-            original_device: storedFingerprint,
-            new_device: deviceFingerprint,
-            ip_address: ipAddress,
-          },
-        });
-
-        await supabaseClient
-          .from("tokens")
-          .update({
-            revoked: true,
-            revoked_reason: "Accès depuis un device non autorisé",
-          })
-          .eq("id", tokenData.id);
-
-        return new Response(
-          JSON.stringify({
-            error: "Accès refusé",
-            reason: "Ce lien ne peut être ouvert que sur l'appareil d'origine. Le lien a été désactivé pour des raisons de sécurité."
-          }),
-          { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
-    }
-
     if (tokenData.ip_addresses && ipAddress) {
       const ipList = tokenData.ip_addresses as string[];
       if (ipList.length > 0 && !ipList.includes(ipAddress)) {
-        if (ipList.length >= 2) {
+        if (ipList.length >= 5) {
           suspiciousActivity = true;
           suspiciousReason = "Accès depuis plusieurs IP";
 
@@ -167,22 +128,6 @@ Deno.serve(async (req: Request) => {
               new_ip: ipAddress,
             },
           });
-
-          await supabaseClient
-            .from("tokens")
-            .update({
-              revoked: true,
-              revoked_reason: "Accès depuis plusieurs localisations différentes",
-            })
-            .eq("id", tokenData.id);
-
-          return new Response(
-            JSON.stringify({
-              error: "Accès refusé",
-              reason: "Accès depuis plusieurs localisations détecté. Ce lien a été désactivé pour des raisons de sécurité."
-            }),
-            { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-          );
         }
       }
     }
