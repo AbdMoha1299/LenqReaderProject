@@ -168,6 +168,18 @@ Deno.serve(async (req: Request) => {
       .eq("statut", "published")
       .maybeSingle();
 
+    const { data: signedUrlData, error: signedUrlError } = await supabaseClient.storage
+      .from("secure-pdfs")
+      .createSignedUrl(pdfData.url_fichier, 3600);
+
+    if (signedUrlError || !signedUrlData?.signedUrl) {
+      console.error("Signed URL error:", signedUrlError);
+      return new Response(
+        JSON.stringify({ error: "Impossible de générer un accès sécurisé au PDF" }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
     if (editionData) {
       return new Response(
         JSON.stringify({
@@ -175,7 +187,7 @@ Deno.serve(async (req: Request) => {
           hasArticles: true,
           editionId: editionData.id,
           editionTitle: editionData.titre,
-          pdfUrl: pdfData.url_fichier,
+          pdfUrl: signedUrlData.signedUrl,
           pdfTitle: pdfData.titre,
           userId: userData.id,
           userName: userData.nom,
@@ -190,7 +202,7 @@ Deno.serve(async (req: Request) => {
       JSON.stringify({
         valid: true,
         hasArticles: false,
-        pdfUrl: pdfData.url_fichier,
+        pdfUrl: signedUrlData.signedUrl,
         pdfTitle: pdfData.titre,
         userId: userData.id,
         userName: userData.nom,

@@ -660,7 +660,6 @@ async (editionIdCandidate: string | null | undefined, pdfPath: string) => {
 
  const applyAccessData = useCallback(
   async (payload: ReaderAccessData) => {
-   const resolvedUrlPromise = resolvePdfUrl(payload.pdfUrl);
    const metadataPromise = fetchEditionMetadata(payload.editionId ?? null, payload.pdfUrl);
 
    const tokenRecord: TokenData = {
@@ -678,13 +677,10 @@ async (editionIdCandidate: string | null | undefined, pdfPath: string) => {
     },
    };
 
-   // Apply immediately so UI can use available metadata while URL resolves
    setTokenData(tokenRecord);
    setHasArticles(payload.hasArticles ?? false);
    setInitialArticleId(null);
-
-   const resolvedUrl = await resolvedUrlPromise;
-   setPdfUrl(resolvedUrl);
+   setPdfUrl(payload.pdfUrl);
 
    metadataPromise
     .then(async (editionIdResolved) => {
@@ -722,7 +718,7 @@ async (editionIdCandidate: string | null | undefined, pdfPath: string) => {
      }
     });
   },
-  [fetchEditionMetadata, loadArticleHotspots, resolvePdfUrl]
+  [fetchEditionMetadata, loadArticleHotspots]
  );
 
  const validateToken = useCallback(async () => {
