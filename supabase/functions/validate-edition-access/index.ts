@@ -175,6 +175,8 @@ Deno.serve(async (req: Request) => {
           hasArticles: true,
           editionId: editionData.id,
           editionTitle: editionData.titre,
+          pdfUrl: pdfData.url_fichier,
+          pdfTitle: pdfData.titre,
           userId: userData.id,
           userName: userData.nom,
           userNumber: userData.numero_abonne,
