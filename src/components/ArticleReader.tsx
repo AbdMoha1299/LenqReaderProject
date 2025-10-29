@@ -301,12 +301,12 @@ export function ArticleReader({
 
   return (
     <div className="relative min-h-screen bg-[#f1f2f6] text-[#1f3b63]">
-      <header className="fixed top-0 left-0 right-0 z-40 bg-[#f5f7fb] border-b border-[#dfe5f2] shadow-sm">
-        <div className="max-w-5xl mx-auto h-16 px-4 lg:px-6 flex items-center justify-between">
+      <header className="sticky top-0 left-0 right-0 z-40 bg-white/95 border-b border-[#dfe5f2] shadow-sm backdrop-blur">
+        <div className="max-w-4xl mx-auto h-14 sm:h-16 px-4 lg:px-6 flex items-center justify-between">
           <div className="flex items-center gap-3 lg:gap-4">
             <button
               onClick={onBackToPDF}
-              className="h-10 w-10 rounded-full border border-[#d7deec] bg-white text-[#1f3b63] flex items-center justify-center shadow-sm hover:shadow-md transition hover:-translate-x-0.5"
+              className="h-10 w-10 rounded-full border border-[#d7deec] bg-white text-[#1f3b63] flex items-center justify-center shadow-sm hover:shadow-md transition hover:-translate-x-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-[#1f3b63]"
               title="Retour au PDF"
             >
               <ArrowLeft className="w-4 h-4" />
@@ -321,10 +321,15 @@ export function ArticleReader({
                   {editionLabel}
                 </span>
               )}
+              {articles.length > 0 && (
+                <span className="sm:hidden text-[11px] font-semibold text-[#60719d] uppercase tracking-wide">
+                  Article {currentIndex + 1} / {articles.length}
+                </span>
+              )}
             </div>
           </div>
 
-          <div className="flex items-center gap-4 text-xs sm:text-sm font-medium">
+          <div className="flex items-center gap-3 sm:gap-4 text-xs sm:text-sm font-medium flex-wrap justify-end">
             <div className="hidden sm:flex items-center gap-2 text-[#1f3b63]">
               <BookOpen className="w-4 h-4" />
               <span>
@@ -348,7 +353,7 @@ export function ArticleReader({
         <button
           type="button"
           onClick={() => setCurrentIndex(i => Math.max(0, i - 1))}
-          className="fixed left-6 top-1/2 -translate-y-1/2 z-30 flex flex-col items-center gap-1 px-3 py-4 rounded-full bg-white border border-[#d7deec] text-[#1f3b63] shadow-lg hover:-translate-x-1 hover:shadow-xl transition disabled:opacity-40 disabled:hover:translate-x-0"
+          className="hidden lg:flex fixed left-6 top-1/2 -translate-y-1/2 z-30 flex-col items-center gap-1 px-3 py-4 rounded-full bg-white border border-[#d7deec] text-[#1f3b63] shadow-lg hover:-translate-x-1 hover:shadow-xl transition disabled:opacity-40 disabled:hover:translate-x-0"
           disabled={!hasPrevious}
         >
           <ChevronLeft className="w-5 h-5" />
@@ -362,7 +367,7 @@ export function ArticleReader({
         <button
           type="button"
           onClick={() => setCurrentIndex(i => Math.min(articles.length - 1, i + 1))}
-          className="fixed right-6 top-1/2 -translate-y-1/2 z-30 flex flex-col items-center gap-1 px-3 py-4 rounded-full bg-white border border-[#d7deec] text-[#1f3b63] shadow-lg hover:translate-x-1 hover:shadow-xl transition disabled:opacity-40 disabled:hover:translate-x-0"
+          className="hidden lg:flex fixed right-6 top-1/2 -translate-y-1/2 z-30 flex-col items-center gap-1 px-3 py-4 rounded-full bg-white border border-[#d7deec] text-[#1f3b63] shadow-lg hover:translate-x-1 hover:shadow-xl transition disabled:opacity-40 disabled:hover:translate-x-0"
           disabled={!hasNext}
         >
           <ChevronRight className="w-5 h-5" />
@@ -372,11 +377,11 @@ export function ArticleReader({
         </button>
       )}
 
-      <main className="pt-24 pb-24 px-4">
+      <main className="pt-20 sm:pt-24 pb-32 sm:pb-24 px-4">
         <div className="max-w-4xl mx-auto space-y-10">
           <article
             ref={articleContentRef}
-            className="bg-white border border-[#dfe5f2] shadow-xl rounded-3xl px-6 sm:px-10 py-10 sm:py-14"
+            className="bg-white border border-[#dfe5f2] shadow-xl rounded-3xl px-5 sm:px-10 py-8 sm:py-14"
           >
             <div className="flex flex-col gap-6 border-b border-[#e2e7f3] pb-6">
               <div className="flex items-start justify-between gap-6">

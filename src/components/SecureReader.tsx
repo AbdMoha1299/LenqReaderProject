@@ -11,6 +11,7 @@ import {
   BookOpen,
 } from 'lucide-react';
 import { supabase } from '../lib/supabase';
+import { ensurePromiseWithResolvers } from '../utils/ensurePromiseWithResolvers';
 import { ArticleView } from './ArticleView';
 
 interface SecureReaderProps {
@@ -319,6 +320,7 @@ export function SecureReader({ token }: SecureReaderProps) {
   }, []);
 
   const loadPdfJs = useCallback(async () => {
+    ensurePromiseWithResolvers();
     if (pdfjsLibRef.current) {
       return pdfjsLibRef.current;
     }
@@ -347,7 +349,7 @@ export function SecureReader({ token }: SecureReaderProps) {
         }
 
         const script = document.createElement('script');
-        script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+        script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.js';
         script.async = true;
         script.dataset.secureReaderPdfjs = 'true';
         script.addEventListener(
@@ -375,7 +377,7 @@ export function SecureReader({ token }: SecureReaderProps) {
     }
 
     pdfjsLibRef.current.GlobalWorkerOptions.workerSrc =
-      'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+      'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.js';
 
     return pdfjsLibRef.current;
   }, []);
@@ -549,7 +551,7 @@ const renderPDF = useCallback(async () => {
       const pdfjsLib = await loadPdfJs();
       const loadingTask = pdfjsLib.getDocument({
         url: pdfUrl,
-        cMapUrl: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/cmaps/',
+        cMapUrl: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/cmaps/',
         cMapPacked: true,
         disableAutoFetch: true,
         disableStream: false,
@@ -573,7 +575,25 @@ const renderPDF = useCallback(async () => {
     } catch (err) {
       console.error('Error loading PDF:', err);
       if (isMountedRef.current) {
-        setError('Erreur lors du chargement du PDF');
+        let detail = '';
+        if (err instanceof Error) {
+          detail = err.message;
+        } else if (err && typeof err === 'object' && 'message' in err) {
+          detail = String((err as any).message);
+        } else if (typeof err === 'string') {
+          detail = err;
+        } else {
+          try {
+            detail = JSON.stringify(err);
+          } catch {
+            detail = String(err);
+          }
+        }
+
+        const message = detail
+          ? `Erreur lors du chargement du PDF : ${detail}`
+          : 'Erreur lors du chargement du PDF';
+        setError(message);
       }
     }
   }, [loadPdfJs, pdfUrl, processRenderQueue]);
@@ -675,6 +695,42 @@ const renderPDF = useCallback(async () => {
     return articles.filter((article) => article.pageNumber === currentPage);
   }, [articles, articlesSource, currentPage]);
 
+  const resolveSecurePdfUrl = useCallback(async (rawPath: string | null | undefined) => {
+    const storagePath = rawPath?.trim?.() ?? '';
+    if (!storagePath) {
+      throw new Error('Document inaccessible');
+    }
+
+    if (/^https?:\/\//i.test(storagePath)) {
+      return storagePath;
+    }
+
+    const trySignedUrl = async () => {
+      const { data: signedData, error: signedError } = await supabase.storage
+        .from('secure-pdfs')
+        .createSignedUrl(storagePath, 60 * 60);
+      if (!signedError && signedData?.signedUrl) {
+        return signedData.signedUrl;
+      }
+      return null;
+    };
+
+    const tryPublicUrl = () => {
+      const {
+        data: { publicUrl },
+      } = supabase.storage.from('secure-pdfs').getPublicUrl(storagePath);
+      return publicUrl || null;
+    };
+
+    const signedUrl = await trySignedUrl();
+    if (signedUrl) return signedUrl;
+
+    const fallbackUrl = tryPublicUrl();
+    if (fallbackUrl) return fallbackUrl;
+
+    throw new Error('Impossible de g�n�rer un acc�s s�curis� au PDF');
+  }, []);
+
   const validateToken = useCallback(async () => {
     if (!token) {
       setError('Lien invalide');
@@ -714,18 +770,12 @@ const renderPDF = useCallback(async () => {
         throw new Error('Document inaccessible');
       }
 
-      const { data: signedData, error: signedError } = await supabase.storage
-        .from('secure-pdfs')
-        .createSignedUrl(data.pdfs.url_fichier, 60);
-
-      if (signedError || !signedData?.signedUrl) {
-        throw new Error('Impossible de générer un accès sécurisé au PDF');
-      }
+      const resolvedPdfUrl = await resolveSecurePdfUrl(data.pdfs.url_fichier);
 
       if (!isMountedRef.current) return;
 
       setTokenData(data as TokenData);
-      setPdfUrl(signedData.signedUrl);
+      setPdfUrl(resolvedPdfUrl);
       loadStructuredArticles(data.pdfs?.url_fichier ?? '', data.pdf_id);
 
       await supabase.from('logs').insert({
@@ -743,9 +793,10 @@ const renderPDF = useCallback(async () => {
         setLoading(false);
       }
     }
-  }, [token, loadStructuredArticles]);
+  }, [token, loadStructuredArticles, resolveSecurePdfUrl]);
 
   useEffect(() => {
+    ensurePromiseWithResolvers();
     validateToken();
   }, [validateToken]);
 
@@ -1199,4 +1250,7 @@ declare global {
     pdfjsLib: any;
   }
 }
+
+
+
 

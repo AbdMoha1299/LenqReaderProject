@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo, type SyntheticEvent } from 'react';
 import {
  AlertCircle,
  ChevronLeft,
@@ -8,12 +8,16 @@ import {
  Maximize,
  Minimize,
  RotateCw,
+ ChevronUp,
+ ChevronDown,
  BookOpen,
  X,
- LayoutGrid,
 } from 'lucide-react';
-import { supabase, Edition } from '../lib/supabase';
 import { ArticleReader } from './ArticleReader';
+import { supabase, Edition } from '../lib/supabase';
+import { ensurePromiseWithResolvers } from '../utils/ensurePromiseWithResolvers';
+
+ensurePromiseWithResolvers();
 
 interface ReaderAccessData {
  tokenId?: string;
@@ -133,32 +137,62 @@ const buildPdfPathCandidates = (rawPath: string | null | undefined) => {
  return { paths: Array.from(result), fileName };
 };
 
+const PDF_JS_VERSION = '4.10.38';
+const PDF_JS_SCRIPT_URL = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PDF_JS_VERSION}/pdf.min.js`;
+const PDF_JS_WORKER_SRC = '/pdfjs/pdf.worker.min.mjs';
+
 let pdfJsLibPromise: Promise<void> | null = null;
 const ACCESS_CACHE_KEY_PREFIX = 'modern-pdf-token:';
 const ACCESS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
+const configurePdfJsLib = (lib: any) => {
+ try {
+  if (lib?.GlobalWorkerOptions) {
+   lib.GlobalWorkerOptions.workerSrc = PDF_JS_WORKER_SRC;
+  }
+  if (typeof lib.disableWorker === 'boolean') {
+   lib.disableWorker = false;
+  }
+ } catch (err) {
+  console.warn('Impossible de configurer pdf.js', err);
+ }
+};
+
 const ensurePdfJsLib = (): Promise<void> => {
+ ensurePromiseWithResolvers();
  if (typeof window === 'undefined') return Promise.resolve();
- if ((window as any).pdfjsLib) return Promise.resolve();
+
+ const existingLib = (window as any).pdfjsLib;
+ if (existingLib) {
+  configurePdfJsLib(existingLib);
+  return Promise.resolve();
+ }
 
  if (!pdfJsLibPromise) {
   pdfJsLibPromise = new Promise((resolve, reject) => {
-   const existing = document.querySelector<HTMLScriptElement>('script[data-pdfjs]');
-   if (existing) {
-    existing.addEventListener('load', () => resolve());
-    existing.addEventListener('error', reject);
+   const existingScript = document.querySelector<HTMLScriptElement>('script[data-pdfjs]');
+   if (existingScript) {
+    existingScript.addEventListener('load', () => {
+     try {
+      configurePdfJsLib((window as any).pdfjsLib);
+      resolve();
+     } catch (err) {
+      reject(err);
+     }
+    });
+    existingScript.addEventListener('error', reject);
     return;
    }
 
    const script = document.createElement('script');
-   script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+   script.src = PDF_JS_SCRIPT_URL;
    script.async = true;
+   script.crossOrigin = 'anonymous';
    script.dataset.pdfjs = 'true';
    script.onload = () => {
     const pdfjsLib = (window as any).pdfjsLib;
     if (pdfjsLib) {
-     pdfjsLib.GlobalWorkerOptions.workerSrc =
-      'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+     configurePdfJsLib(pdfjsLib);
      resolve();
     } else {
      reject(new Error('pdfjsLib unavailable apres chargement du script'));
@@ -166,10 +200,10 @@ const ensurePdfJsLib = (): Promise<void> => {
    };
    script.onerror = reject;
    document.head.appendChild(script);
- });
-}
+  });
+ }
 
-return pdfJsLibPromise;
+ return pdfJsLibPromise;
 };
 
 const readCachedAccessData = (token: string): ReaderAccessData | null => {
@@ -219,6 +253,8 @@ export function ModernPDFReader({ token, initialData }: ModernPDFReaderProps) {
  const isRenderingRef = useRef(false);
  const pendingRenderRef = useRef<{ page: number; rotation: number; scale: number } | null>(null);
  const [pdfReady, setPdfReady] = useState(false);
+const [isSpreadMode, setIsSpreadMode] = useState(true);
+ const [tocOpen, setTocOpen] = useState(false);
  const [checkingArticles, setCheckingArticles] = useState(false);
  const [articleHotspots, setArticleHotspots] = useState<Record<number, ArticleHotspot[]>>({});
  const [initialArticleId, setInitialArticleId] = useState<string | null>(null);
@@ -261,34 +297,133 @@ export function ModernPDFReader({ token, initialData }: ModernPDFReaderProps) {
 
  const containerRef = useRef<HTMLDivElement>(null);
  const canvasRef = useRef<HTMLCanvasElement>(null);
- const touchStartRef = useRef({ x: 0, y: 0, distance: 0, time: 0 });
- const scaleRef = useRef(1);
- const rotationRef = useRef(0);
- const currentPageRef = useRef(1);
- const lastRenderRef = useRef<{
-  page: number;
-  rotation: number;
-  scale: number;
-  containerWidth: number;
-  containerHeight: number;
- } | null>(null);
- const isMobile = typeof window !== 'undefined' ? window.innerWidth < 768 : false;
-
- const clampPage = useCallback(
-  (page: number) => {
-    if (!totalPages || totalPages <= 1) return 1;
-    if (page <= 1) return 1;
-    if (page >= totalPages) return totalPages;
-    return page;
-  },
-  [totalPages]
+const touchStartRef = useRef({ x: 0, y: 0, distance: 0, time: 0 });
+const scaleRef = useRef(1);
+const rotationRef = useRef(0);
+const currentPageRef = useRef(1);
+const lastRenderRef = useRef<{
+ page: number;
+ rotation: number;
+ scale: number;
+ containerWidth: number;
+ containerHeight: number;
+ spread: number;
+} | null>(null);
+const isBrowser = typeof window !== 'undefined';
+const [viewportWidth, setViewportWidth] = useState(() =>
+ isBrowser ? window.innerWidth : 1024
+);
+const [viewportHeight, setViewportHeight] = useState(() =>
+ isBrowser ? window.innerHeight : 768
 );
 
- const setCurrentPage = useCallback(
-  (value: number | ((prev: number) => number)) => {
-    if (typeof value === 'function') {
-      setCurrentPageState(prev => clampPage(value(prev)));
-    } else {
+useEffect(() => {
+ if (!isBrowser) return;
+
+ const handleResize = () => {
+  setViewportWidth(window.innerWidth);
+  setViewportHeight(window.innerHeight);
+ };
+
+ handleResize();
+ window.addEventListener('resize', handleResize);
+ window.addEventListener('orientationchange', handleResize);
+
+ return () => {
+  window.removeEventListener('resize', handleResize);
+  window.removeEventListener('orientationchange', handleResize);
+ };
+}, [isBrowser]);
+
+const isMobile = viewportWidth < 768;
+const isTablet = viewportWidth >= 768 && viewportWidth < 1024;
+
+useEffect(() => {
+ if (isMobile && isSpreadMode) {
+  setIsSpreadMode(false);
+ }
+ if (!isMobile && !isSpreadMode && viewportWidth >= 1024) {
+  setIsSpreadMode(true);
+ }
+}, [isMobile, isSpreadMode, viewportWidth]);
+
+ const spreadConfig = useMemo(() => {
+  const groups: number[] = [];
+  const doubleStarts = new Set<number>();
+
+  if (!totalPages || totalPages <= 0) {
+   return { groups, doubleStarts };
+  }
+
+  if (!isSpreadMode) {
+   for (let page = 1; page <= totalPages; page += 1) {
+    groups.push(page);
+   }
+   return { groups, doubleStarts };
+  }
+
+  groups.push(1);
+  if (totalPages === 1) {
+   return { groups, doubleStarts };
+  }
+
+  let page = 2;
+  while (page <= totalPages) {
+   if (page === totalPages) {
+    groups.push(page);
+    break;
+   }
+
+   if (page + 1 === totalPages) {
+    groups.push(page);
+    doubleStarts.add(page);
+    groups.push(totalPages);
+    break;
+   }
+
+   groups.push(page);
+   doubleStarts.add(page);
+   page += 2;
+  }
+
+  return { groups, doubleStarts };
+ }, [isSpreadMode, totalPages]);
+
+ const spreadGroups = spreadConfig.groups;
+ const spreadDoubleStarts = spreadConfig.doubleStarts;
+
+const clampPage = useCallback(
+ (page: number) => {
+  if (!totalPages || totalPages <= 1) return 1;
+  let normalized = Math.max(1, Math.min(page, totalPages));
+
+  if (!isSpreadMode || spreadGroups.length === 0) {
+   return normalized;
+  }
+
+  let target = spreadGroups[0];
+  for (const start of spreadGroups) {
+   if (start <= normalized) {
+    target = start;
+   } else {
+    break;
+   }
+  }
+  return target;
+ },
+ [isSpreadMode, spreadGroups, totalPages]
+);
+
+const shouldRenderSecondPage = useCallback(
+ (pageNumber: number) => isSpreadMode && spreadDoubleStarts.has(pageNumber),
+ [spreadDoubleStarts, isSpreadMode]
+);
+
+const setCurrentPage = useCallback(
+ (value: number | ((prev: number) => number)) => {
+  if (typeof value === 'function') {
+   setCurrentPageState(prev => clampPage(value(prev)));
+  } else {
       setCurrentPageState(clampPage(value));
     }
   },
@@ -794,7 +929,9 @@ async (editionIdCandidate: string | null | undefined, pdfPath: string) => {
    const data = await response.json();
 
    if (!response.ok || data?.error) {
-    setError(data?.error || 'Token invalide');
+    const reason = typeof data?.reason === 'string' ? data.reason : '';
+    const baseError = data?.error || 'Token invalide';
+    setError(reason ? `${baseError} : ${reason}` : baseError);
     return;
    }
 
@@ -849,40 +986,133 @@ useEffect(() => {
  }, [clampPage]);
 
 const goToPreviousPage = useCallback(() => {
-  setCurrentPage(prev => (prev <= 1 ? 1 : prev - 1));
-}, [setCurrentPage]);
+  setCurrentPage(prev => {
+   if (!spreadGroups.length) return 1;
+   let index = spreadGroups.findIndex(start => start === prev);
+   if (index === -1) {
+    index = spreadGroups.findIndex(start => start > prev);
+    if (index === -1) {
+     index = spreadGroups.length;
+    }
+    index -= 1;
+   }
+   if (index <= 0) {
+    return spreadGroups[0];
+   }
+   return spreadGroups[index - 1];
+  });
+}, [setCurrentPage, spreadGroups]);
 
 const goToNextPage = useCallback(() => {
   setCurrentPage(prev => {
-    if (!totalPages || prev >= totalPages) return prev;
-    return prev + 1;
+   if (!spreadGroups.length) return prev;
+   const index = spreadGroups.findIndex(start => start === prev);
+   if (index === -1) {
+    return prev;
+   }
+   if (index >= spreadGroups.length - 1) {
+    return prev;
+   }
+   return spreadGroups[index + 1];
   });
-}, [setCurrentPage, totalPages]);
+}, [setCurrentPage, spreadGroups]);
 
-const pageRangeLabel = `${currentPage}`;
+const currentGroupIndex = useMemo(() => {
+ if (!spreadGroups.length) return -1;
+ return spreadGroups.findIndex(start => start === currentPage);
+}, [currentPage, spreadGroups]);
 
-const hasPreviousPage = currentPage > 1;
-const hasNextPage = totalPages ? currentPage < totalPages : false;
+const currentHasSecondPage = shouldRenderSecondPage(currentPage);
 
-const previousPageLabel = `P ${Math.max(1, currentPage - 1)}`;
-const nextPageLabel = `P ${totalPages ? Math.min(totalPages, currentPage + 1) : currentPage + 1}`;
+const pageRangeLabel =
+ currentHasSecondPage && totalPages
+  ? `${currentPage}-${Math.min(totalPages, currentPage + 1)}`
+  : `${currentPage}`;
+
+const hasPreviousPage = currentGroupIndex > 0;
+const hasNextPage = currentGroupIndex !== -1 && currentGroupIndex < spreadGroups.length - 1;
+
+const previousTargetPage =
+ hasPreviousPage && currentGroupIndex > 0 ? spreadGroups[currentGroupIndex - 1] : currentPage;
+const nextTargetPage =
+ hasNextPage && currentGroupIndex >= 0 ? spreadGroups[currentGroupIndex + 1] : currentPage;
+
+const formatPageLabel = (start: number) => {
+ if (shouldRenderSecondPage(start)) {
+  return `P ${start}-${Math.min(totalPages, start + 1)}`;
+ }
+ return `P ${start}`;
+};
+
+const spreadSlotCount = currentHasSecondPage ? 2 : 1;
+
+const previousPageLabel = formatPageLabel(previousTargetPage);
+const nextPageLabel = formatPageLabel(nextTargetPage);
 const hotspotsForCurrentPage = articleHotspots[currentPage] || [];
+const hasAnyHotspot = useMemo(
+ () => Object.values(articleHotspots).some((list) => Array.isArray(list) && list.length > 0),
+ [articleHotspots]
+);
 
+const activeSpreadPages = useMemo(() => {
+ const pages = new Set<number>();
+ pages.add(currentPage);
+ if (shouldRenderSecondPage(currentPage)) {
+  pages.add(currentPage + 1);
+ }
+ return pages;
+}, [currentPage, shouldRenderSecondPage]);
+
+const hotspotsForSpread = useMemo(() => {
+ if (!isSpreadMode) {
+  return articleHotspots[currentPage] || [];
+ }
+ if (!shouldRenderSecondPage(currentPage)) {
+  return articleHotspots[currentPage] || [];
+ }
+ const currentHotspots = (articleHotspots[currentPage] || []).map(h => ({
+  ...h,
+  pageNumber: currentPage,
+  spreadOffset: 0,
+ }));
+ const nextHotspots =
+  shouldRenderSecondPage(currentPage)
+   ? (articleHotspots[currentPage + 1] || []).map(h => ({
+      ...h,
+      pageNumber: currentPage + 1,
+      spreadOffset: 1,
+     }))
+   : [];
+
+ return [...currentHotspots, ...nextHotspots];
+}, [articleHotspots, currentPage, isSpreadMode, shouldRenderSecondPage, totalPages]);
+
+const handleSelectPage = useCallback(
+ (pageNumber: number) => {
+  if (!totalPages) return;
+  const normalized = clampPage(pageNumber);
+  setCurrentPage(normalized);
+  setTocOpen(false);
+ },
+ [clampPage, setCurrentPage, totalPages]
+);
 
 const applyWatermark = useCallback(
- (context: CanvasRenderingContext2D, canvas: HTMLCanvasElement, pageNumber: number) => {
+ (context: CanvasRenderingContext2D, bounds: { width: number; height: number; offsetX: number }, pageNumber: number) => {
   if (!tokenData?.users?.nom) return;
 
   context.save();
   context.globalAlpha = 0.08;
 
-  const fontSize = Math.max(14, Math.min(canvas.width * 0.02, 24));
+  context.translate(bounds.offsetX, 0);
+
+  const fontSize = Math.max(14, Math.min(bounds.width * 0.02, 24));
   context.font = `600 ${fontSize}px system-ui, -apple-system, sans-serif`;
   context.fillStyle = '#64748B';
   context.textAlign = 'center';
 
-  const centerX = canvas.width / 2;
-  const centerY = canvas.height / 2;
+  const centerX = bounds.width / 2;
+  const centerY = bounds.height / 2;
 
   context.translate(centerX, centerY);
   context.rotate(-Math.PI / 8);
@@ -909,92 +1139,129 @@ useEffect(() => {
 
 const renderPage = useCallback(
  async (pageNumber: number, renderRotation: number, renderScale: number) => {
- const pdf = (window as any).pdfDocument;
- if (!pdf) return;
+  const pdf = (window as any).pdfDocument;
+  if (!pdf) return;
 
- const canvas = canvasRef.current;
- if (!canvas) {
-  pendingRenderRef.current = { page: pageNumber, rotation: renderRotation, scale: renderScale };
-  return;
- }
-
- const containerWidth = containerRef.current?.clientWidth ?? window.innerWidth - 32;
- const containerHeight = window.innerHeight - (isMobile ? 140 : 180);
- const lastRender = lastRenderRef.current;
-
- if (
-  lastRender &&
-  lastRender.page === pageNumber &&
-  lastRender.rotation === renderRotation &&
-  lastRender.scale === renderScale &&
-  lastRender.containerWidth === containerWidth &&
-  lastRender.containerHeight === containerHeight
- ) {
-  return;
- }
-
- if (isRenderingRef.current) {
-  pendingRenderRef.current = { page: pageNumber, rotation: renderRotation, scale: renderScale };
-  return;
- }
-
- isRenderingRef.current = true;
-
- try {
-  const page = await pdf.getPage(pageNumber);
-  const context = canvas.getContext('2d');
-  if (!context) {
-    isRenderingRef.current = false;
-    return;
+  const canvas = canvasRef.current;
+  if (!canvas) {
+   pendingRenderRef.current = { page: pageNumber, rotation: renderRotation, scale: renderScale };
+   return;
   }
 
-  const baseViewport = page.getViewport({ scale: 1, rotation: renderRotation });
-
-  const baseScaleRaw = Math.min(
-   containerWidth / baseViewport.width,
-   containerHeight / baseViewport.height
+  const containerWidth =
+   containerRef.current?.clientWidth ?? Math.max(320, viewportWidth - 32);
+  const containerHeight = Math.max(
+   200,
+   viewportHeight - (isMobile ? 220 : isTablet ? 220 : 260)
   );
+  const pagesToRender: number[] = [pageNumber];
+  if (isSpreadMode && shouldRenderSecondPage(pageNumber)) {
+   pagesToRender.push(pageNumber + 1);
+  }
+
+  const lastRender = lastRenderRef.current;
+
+  if (
+   lastRender &&
+   lastRender.page === pageNumber &&
+   lastRender.rotation === renderRotation &&
+   lastRender.scale === renderScale &&
+   lastRender.containerWidth === containerWidth &&
+   lastRender.containerHeight === containerHeight &&
+   lastRender.spread === pagesToRender.length
+  ) {
+   return;
+  }
+
+  if (isRenderingRef.current) {
+   pendingRenderRef.current = { page: pageNumber, rotation: renderRotation, scale: renderScale };
+   return;
+  }
+
+  isRenderingRef.current = true;
+
+  try {
+   const pdfPages = await Promise.all(pagesToRender.map((num) => pdf.getPage(num)));
+   const context = canvas.getContext('2d');
+   if (!context) {
+    isRenderingRef.current = false;
+    return;
+   }
+
+   const baseViewports = pdfPages.map((page) =>
+    page.getViewport({ scale: 1, rotation: renderRotation })
+   );
+   const totalBaseWidth = baseViewports.reduce((sum, viewport) => sum + viewport.width, 0);
+   const maxBaseHeight = baseViewports.reduce(
+    (max, viewport) => Math.max(max, viewport.height),
+    0
+   );
+
+   const baseScaleRaw = Math.min(
+    containerWidth / totalBaseWidth,
+    containerHeight / maxBaseHeight
+   );
 
    const baseScale = Math.max(Math.min(baseScaleRaw, 1) * 0.98, 0.1);
    const effectiveScale = baseScale * renderScale;
-   const viewport = page.getViewport({ scale: effectiveScale, rotation: renderRotation });
+
+   const scaledViewports = pdfPages.map((page) =>
+    page.getViewport({ scale: effectiveScale, rotation: renderRotation })
+   );
+
+   const totalWidth = scaledViewports.reduce((sum, viewport) => sum + viewport.width, 0);
+   const maxHeight = scaledViewports.reduce((max, viewport) => Math.max(max, viewport.height), 0);
 
    const dpr = window.devicePixelRatio || 1;
-   canvas.width = Math.max(1, Math.round(viewport.width * dpr));
-   canvas.height = Math.max(1, Math.round(viewport.height * dpr));
-   canvas.style.width = `${viewport.width}px`;
-   canvas.style.height = `${viewport.height}px`;
+   canvas.width = Math.max(1, Math.round(totalWidth * dpr));
+   canvas.height = Math.max(1, Math.round(maxHeight * dpr));
+   canvas.style.width = `${totalWidth}px`;
+   canvas.style.height = `${maxHeight}px`;
 
    context.setTransform(dpr, 0, 0, dpr, 0, 0);
-   context.clearRect(0, 0, viewport.width, viewport.height);
+   context.clearRect(0, 0, totalWidth, maxHeight);
 
-  await page.render({
-   canvasContext: context,
-   viewport,
-  }).promise;
+   let offsetX = 0;
 
-  applyWatermark(context, canvas, pageNumber);
-  lastRenderRef.current = {
-   page: pageNumber,
-   rotation: renderRotation,
-   scale: renderScale,
-   containerWidth,
-   containerHeight,
-  };
-  setPdfReady(true);
- } catch (err) {
-  console.error('Error rendering page:', err);
- } finally {
-  isRenderingRef.current = false;
+   for (let index = 0; index < pdfPages.length; index += 1) {
+    const page = pdfPages[index];
+    const viewport = scaledViewports[index];
+
+    context.save();
+    context.translate(offsetX, 0);
+    await page.render({
+     canvasContext: context,
+     viewport,
+    }).promise;
+    context.restore();
+
+    applyWatermark(context, { width: viewport.width, height: viewport.height, offsetX }, pagesToRender[index]);
+
+    offsetX += viewport.width;
+   }
+
+   lastRenderRef.current = {
+    page: pageNumber,
+    rotation: renderRotation,
+    scale: renderScale,
+    containerWidth,
+    containerHeight,
+    spread: pagesToRender.length,
+   };
+   setPdfReady(true);
+  } catch (err) {
+   console.error('Error rendering page:', err);
+  } finally {
+   isRenderingRef.current = false;
 
    if (pendingRenderRef.current) {
     const next = pendingRenderRef.current;
     pendingRenderRef.current = null;
     await renderPage(next.page, next.rotation, next.scale);
    }
- }
+  }
  },
- [applyWatermark, isMobile]
+ [applyWatermark, isMobile, isSpreadMode, shouldRenderSecondPage, totalPages, viewportHeight, viewportWidth, isTablet]
 );
 const latestRenderPageRef = useRef(renderPage);
 useEffect(() => {
@@ -1020,7 +1287,7 @@ useEffect(() => {
 
    const loadingTask = window.pdfjsLib.getDocument({
     url: pdfUrl,
-    cMapUrl: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/cmaps/',
+    cMapUrl: `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PDF_JS_VERSION}/cmaps/`,
     cMapPacked: true,
    });
 
@@ -1040,7 +1307,26 @@ useEffect(() => {
  } catch (err) {
    if (!cancelled) {
     console.error('Error loading PDF:', err);
-    setError('Erreur lors du chargement du PDF');
+    let detail = '';
+    if (err instanceof Error) {
+      detail = err.message;
+    } else if (err && typeof err === 'object' && 'message' in err) {
+      detail = String((err as any).message);
+    } else if (typeof err === 'string') {
+      detail = err;
+    } else {
+      try {
+        detail = JSON.stringify(err);
+      } catch {
+        detail = String(err);
+      }
+    }
+
+    setError(
+      detail
+        ? `Erreur lors du chargement du PDF : ${detail}`
+        : 'Erreur lors du chargement du PDF'
+    );
    }
   }
  };
@@ -1070,7 +1356,7 @@ useEffect(() => {
  renderPage(pending.page, pending.rotation, pending.scale);
 }, [loading, renderPage, viewMode]);
 useEffect(() => {
-  if (!editionId || lastHotspotEditionRef.current === editionId) return;
+ if (!editionId || lastHotspotEditionRef.current === editionId) return;
 
   loadArticleHotspots(editionId)
     .then(() => {
@@ -1094,11 +1380,16 @@ useEffect(() => {
   }
 }, [viewMode, editionId, pendingArticleId, initialArticleId]);
 
+useEffect(() => {
+ if (viewMode !== 'pdf') {
+  setTocOpen(false);
+ }
+}, [viewMode]);
 
- const handleZoomIn = () => setScale(prev => Math.min(prev + 0.25, 3));
- const handleZoomOut = () => setScale(prev => Math.max(prev - 0.25, 0.5));
- const handleRotate = () => setRotation(prev => (prev + 90) % 360);
 
+const handleZoomIn = () => setScale(prev => Math.min(prev + 0.25, 3));
+const handleZoomOut = () => setScale(prev => Math.max(prev - 0.25, 0.5));
+const handleRotate = () => setRotation(prev => (prev + 90) % 360);
  const toggleFullscreen = () => {
   if (!document.fullscreenElement) {
    document.documentElement.requestFullscreen();
@@ -1175,13 +1466,40 @@ useEffect(() => {
   touchStartRef.current = { x: 0, y: 0, distance: 0, time: 0 };
  };
 
- const handleHotspotClick = (hotspot: ArticleHotspot) => {
-  setPendingArticleId(hotspot.id);
-  if (editionId) {
-    setInitialArticleId(hotspot.id);
+const openArticleMode = useCallback(
+ (targetArticleId?: string | null) => {
+  if (!hasArticles && !hasAnyHotspot) {
+   return;
   }
+
+  const resolvedTarget =
+   targetArticleId ||
+   initialArticleId ||
+   firstArticleId ||
+   Object.values(articleHotspots).find((list) => list?.length)?.[0]?.id ||
+   null;
+
+  if (resolvedTarget) {
+   setPendingArticleId(resolvedTarget);
+   if (editionId) {
+    setInitialArticleId(resolvedTarget);
+   }
+  }
+
+  setTocOpen(false);
   setViewMode('article');
- };
+ },
+ [articleHotspots, editionId, firstArticleId, hasAnyHotspot, hasArticles, initialArticleId]
+);
+
+const handleHotspotActivate = useCallback(
+ (event: SyntheticEvent, hotspot: ArticleHotspot) => {
+  event.preventDefault();
+  event.stopPropagation();
+  openArticleMode(hotspot.id);
+ },
+ [openArticleMode]
+);
 
  if (loading) {
   return (
@@ -1253,7 +1571,9 @@ const articleView = (() => {
 })();
 
  const controlButtonClass =
-  'h-10 w-10 rounded-full border border-[#d7deec] bg-white text-[#1f3b63] flex items-center justify-center shadow-sm transition hover:shadow-md disabled:opacity-40 disabled:cursor-not-allowed';
+  'h-10 w-10 rounded-full border border-[#d7deec] bg-white text-[#1f3b63] flex items-center justify-center shadow-sm transition hover:shadow-md disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-[#1f3b63]';
+ const mobileNavButtonClass =
+  'flex-1 min-w-[68px] flex flex-col items-center justify-center rounded-2xl border border-[#dfe5f2] bg-white text-[#1f3b63] text-xs font-semibold py-2 px-2 shadow-sm active:scale-[0.97] transition disabled:opacity-40 disabled:pointer-events-none';
  const sideNavButtonBase =
   'absolute top-1/2 -translate-y-1/2 z-30 flex flex-col items-center gap-1 px-3 py-4 rounded-full bg-white border border-[#d7deec] text-[#1f3b63] shadow-lg transition disabled:opacity-40 disabled:pointer-events-none';
 
@@ -1266,7 +1586,7 @@ const articleView = (() => {
     onTouchMove={handleTouchMove}
     onTouchEnd={handleTouchEnd}
    >
-   <header className="fixed top-0 left-0 right-0 z-40 bg-[#f5f7fb] border-b border-[#dfe5f2] shadow-sm">
+   <header className="fixed top-0 left-0 right-0 z-40 bg-[#ffffff] border-b border-[#dfe5f2] shadow-sm">
     <div className="max-w-6xl mx-auto h-16 px-4 lg:px-6 flex items-center justify-between">
      <div className="flex items-center gap-4">
       <button
@@ -1332,9 +1652,17 @@ const articleView = (() => {
     </div>
    </header>
 
-   <main className="flex-1 w-full relative pt-24 pb-20 px-4">
-    <div className="relative max-w-5xl mx-auto flex items-center justify-center">
-     {hasPreviousPage && (
+   <main
+    className={`flex-1 w-full relative pt-24 px-4 ${
+     isMobile ? 'pb-[calc(6.5rem+env(safe-area-inset-bottom,0px))]' : 'pb-20'
+    }`}
+   >
+    <div
+     className={`relative mx-auto flex items-center justify-center ${
+      isMobile ? 'max-w-full' : 'max-w-5xl'
+     }`}
+    >
+     {!isMobile && hasPreviousPage && (
       <button
        type="button"
        onClick={goToPreviousPage}
@@ -1363,30 +1691,40 @@ const articleView = (() => {
       </div>
      )}
 
-     {viewMode === 'pdf' &&
-      hotspotsForCurrentPage.map((hotspot) => (
-        <button
-         key={`${hotspot.id}-${hotspot.ordre}`}
-         type="button"
-         onClick={(event) => {
-          event.stopPropagation();
-          handleHotspotClick(hotspot);
-         }}
-         className="absolute border border-transparent bg-[#1f3b63]/0 hover:bg-[#1f3b63]/10 focus-visible:bg-[#1f3b63]/12 rounded-lg transition-colors duration-200"
-         style={{
-          left: `${clamp01(hotspot.x) * 100}%`,
-          top: `${clamp01(hotspot.y) * 100}%`,
-          width: `${clamp01(hotspot.width) * 100}%`,
-          height: `${clamp01(hotspot.height) * 100}%`,
-         }}
-         title={hotspot.titre}
-        >
-         <span className="sr-only">{hotspot.titre}</span>
-        </button>
-       ))}
+      {viewMode === 'pdf' &&
+       (isSpreadMode ? hotspotsForSpread : hotspotsForCurrentPage).map((hotspot) => {
+        const spreadOffset = (hotspot as { spreadOffset?: number }).spreadOffset ?? 0;
+        const pageWidthPercent = 100 / Math.max(1, spreadSlotCount);
+        const leftPercent = spreadOffset * pageWidthPercent + clamp01(hotspot.x) * pageWidthPercent;
+        const widthPercent = clamp01(hotspot.width) * pageWidthPercent;
+
+        return (
+         <button
+          key={`${hotspot.id}-${hotspot.ordre}-${spreadOffset}`}
+          type="button"
+          onClick={(event) => handleHotspotActivate(event, hotspot)}
+          onPointerUp={(event) => {
+           if (event.pointerType !== 'mouse') {
+            handleHotspotActivate(event, hotspot);
+           }
+          }}
+          className="absolute border border-transparent bg-[#1f3b63]/0 hover:bg-[#1f3b63]/10 focus-visible:bg-[#1f3b63]/12 rounded-lg transition-colors duration-200"
+          style={{
+           left: `${leftPercent}%`,
+           top: `${clamp01(hotspot.y) * 100}%`,
+           width: `${widthPercent}%`,
+           height: `${clamp01(hotspot.height) * 100}%`,
+           touchAction: 'manipulation',
+          }}
+          title={hotspot.titre}
+         >
+          <span className="sr-only">{hotspot.titre}</span>
+         </button>
+        );
+       })}
      </div>
 
-     {hasNextPage && (
+      {!isMobile && hasNextPage && (
       <button
        type="button"
        onClick={goToNextPage}
@@ -1399,26 +1737,128 @@ const articleView = (() => {
        </span>
       </button>
      )}
-    </div>
-   </main>
+   </div>
+  </main>
 
-   {hasArticles && (
+   {isMobile && viewMode === 'pdf' && (
+    <nav className="fixed bottom-0 left-0 right-0 z-40 bg-white/95 border-t border-[#dfe5f2] backdrop-blur-md px-4 pb-[calc(env(safe-area-inset-bottom,0px)+10px)] pt-3">
+     <div className="max-w-3xl mx-auto flex items-center gap-2">
+      <button
+       type="button"
+       onClick={goToPreviousPage}
+       disabled={!hasPreviousPage}
+       className={mobileNavButtonClass}
+       title="Page precedente"
+      >
+       <ChevronLeft className="w-4 h-4 mb-1" />
+       <span>Precedente</span>
+      </button>
+      <button
+       type="button"
+       onClick={() => setTocOpen(prev => !prev)}
+       className={`${mobileNavButtonClass} ${tocOpen ? 'bg-[#1f3b63] text-white border-[#1f3b63]' : ''}`}
+       title={tocOpen ? 'Masquer la table des matieres' : 'Afficher la table des matieres'}
+      >
+       <ChevronUp className="w-4 h-4 mb-1 transition-transform duration-150" style={{ transform: tocOpen ? 'rotate(180deg)' : 'rotate(0deg)' }} />
+       <span>Sommaire</span>
+      </button>
+      {hasArticles && (
+       <button
+        type="button"
+        onClick={() => openArticleMode()}
+        disabled={checkingArticles}
+        className={mobileNavButtonClass}
+        title="Mode article"
+       >
+        <BookOpen className="w-4 h-4 mb-1" />
+        <span>Article</span>
+       </button>
+      )}
+      <button
+       type="button"
+       onClick={goToNextPage}
+       disabled={!hasNextPage}
+       className={mobileNavButtonClass}
+       title="Page suivante"
+      >
+       <ChevronRight className="w-4 h-4 mb-1" />
+       <span>Suivante</span>
+      </button>
+     </div>
+    </nav>
+   )}
+
+   {totalPages > 1 && (
+    <>
+     {!isMobile && (
+      <button
+      type="button"
+      onClick={() => setTocOpen(prev => !prev)}
+      disabled={!pdfReady}
+      className={`fixed bottom-20 left-1/2 -translate-x-1/2 z-40 h-10 w-10 rounded-full border border-[#d7deec] bg-white text-[#1f3b63] shadow-md flex items-center justify-center transition ${
+       pdfReady ? 'hover:shadow-lg' : 'opacity-40 cursor-not-allowed'
+      }`}
+      title={tocOpen ? 'Masquer la table des matieres' : 'Afficher la table des matieres'}
+     >
+      {tocOpen ? <ChevronDown className="w-5 h-5" /> : <ChevronUp className="w-5 h-5" />}
+      </button>
+     )}
+
+     <div
+      className={`fixed left-0 right-0 z-30 transform transition-transform duration-300 ${
+       tocOpen ? 'translate-y-0' : 'translate-y-full pointer-events-none'
+      }`}
+      style={{
+       bottom: isMobile
+        ? 'calc(env(safe-area-inset-bottom, 0px) + 86px)'
+        : '0px',
+      }}
+     >
+      <div
+       className={`mx-auto ${isMobile ? 'max-w-full' : 'max-w-6xl'} bg-white/95 border-t border-[#dfe5f2] shadow-lg rounded-t-3xl px-4 py-4 backdrop-blur-md`}
+      >
+       <div className="flex items-center justify-between mb-3">
+        <p className="text-xs font-semibold text-[#1f3b63] uppercase tracking-wide">
+         Table des matieres
+        </p>
+        <span className="text-[11px] text-[#60719d]">
+         {pageRangeLabel} / {totalPages}
+        </span>
+       </div>
+       <div className="flex gap-2 overflow-x-auto pb-1">
+        {Array.from({ length: totalPages }, (_, index) => {
+         const pageNumber = index + 1;
+         const isActive = activeSpreadPages.has(pageNumber);
+         return (
+          <button
+           key={pageNumber}
+           type="button"
+           onClick={() => handleSelectPage(pageNumber)}
+           className={`min-w-[56px] px-3 py-2 rounded-xl border text-xs font-medium transition-all ${
+            isActive
+             ? 'border-amber-500 bg-amber-500/15 text-amber-600 shadow-sm'
+             : 'border-[#dfe5f2] bg-white text-[#1f3b63] hover:border-amber-400 hover:bg-amber-50'
+           }`}
+          >
+           P {pageNumber}
+          </button>
+         );
+        })}
+       </div>
+      </div>
+     </div>
+    </>
+   )}
+
+  {!isMobile && hasArticles && (
     <button
      type="button"
-     onClick={() => {
-      if (!initialArticleId && firstArticleId) {
-       setPendingArticleId(firstArticleId);
-       if (editionId) {
-        setInitialArticleId(firstArticleId);
-       }
-      }
-      setViewMode('article');
-     }}
+     onClick={() => openArticleMode()}
      disabled={checkingArticles}
-     className="fixed bottom-10 right-6 z-30 h-14 w-14 rounded-full border border-[#d7deec] bg-white text-[#1f3b63] shadow-lg hover:shadow-xl transition disabled:opacity-50"
+     className="fixed bottom-10 right-6 z-40 h-14 w-14 rounded-full border border-[#d7deec] bg-white text-[#1f3b63] shadow-lg hover:shadow-xl transition disabled:opacity-50"
      title="Mode article"
     >
-     <LayoutGrid className="w-6 h-6 mx-auto" />
+     <BookOpen className="w-6 h-6 mx-auto" />
     </button>
    )}
 
@@ -1449,3 +1889,4 @@ declare global {
   pdfDocument: any;
  }
 }
+

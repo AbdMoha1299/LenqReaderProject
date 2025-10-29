@@ -46,7 +46,8 @@ interface FormState {
 
 const MIN_RECT_SIZE = 0.01;
 
-const clamp01 = (value: number) => Math.max(0, Math.min(1, value));
+const clamp01 = (value: number) =>
+  Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0));
 
 const wordsCount = (text: string) => {
   if (!text) return 0;
@@ -261,12 +262,15 @@ export function ArticleZoneEditor({ editionId, onClose }: ArticleZoneEditorProps
   );
 
   const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
     const allowRedraw = formState?.mode === 'edit';
     if (!selectedPage || saving || !pdfDoc) return;
     if (formState && !allowRedraw) return;
 
-    const bounds = canvasRef.current?.getBoundingClientRect();
+    const bounds = pdfCanvasRef.current?.getBoundingClientRect();
     if (!bounds) return;
+
+    event.preventDefault();
 
     const pointerX = clamp01((event.clientX - bounds.left) / bounds.width);
     const pointerY = clamp01((event.clientY - bounds.top) / bounds.height);
@@ -275,12 +279,13 @@ export function ArticleZoneEditor({ editionId, onClose }: ArticleZoneEditorProps
     setDrawOrigin(originRect);
     setDraftRect(originRect);
 
-    (event.target as HTMLElement).setPointerCapture(event.pointerId);
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
   };
 
   const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (!drawOrigin || !canvasRef.current) return;
-    const bounds = canvasRef.current.getBoundingClientRect();
+    if (!drawOrigin || !pdfCanvasRef.current) return;
+    const bounds = pdfCanvasRef.current.getBoundingClientRect();
+    if (!bounds) return;
     const currentX = clamp01((event.clientX - bounds.left) / bounds.width);
     const currentY = clamp01((event.clientY - bounds.top) / bounds.height);
 
@@ -319,7 +324,7 @@ export function ArticleZoneEditor({ editionId, onClose }: ArticleZoneEditorProps
   const handlePointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
     if (!drawOrigin) return;
     finalizeDraftRect();
-    (event.target as HTMLElement).releasePointerCapture(event.pointerId);
+    (event.currentTarget as HTMLElement).releasePointerCapture(event.pointerId);
   };
 
   const handlePointerLeave = () => {

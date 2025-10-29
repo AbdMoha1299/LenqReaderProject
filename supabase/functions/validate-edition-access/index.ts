@@ -95,7 +95,7 @@ Deno.serve(async (req: Request) => {
 
     const { data: userData, error: userError } = await supabaseClient
       .from("users")
-      .select("id, nom, numero_abonne, statut_abonnement, numero_whatsapp")
+      .select("id, nom, numero_abonne, statut_abonnement, numero_whatsapp, devices_autorises")
       .eq("id", tokenData.user_id)
       .maybeSingle();
 
@@ -107,8 +107,99 @@ Deno.serve(async (req: Request) => {
       );
     }
 
+    await supabaseClient.rpc("refresh_user_subscription_status", {
+      p_user_id: tokenData.user_id,
+    });
+
+    const { data: hasAccess, error: accessError } = await supabaseClient.rpc("user_has_access_to_edition", {
+      p_user_id: tokenData.user_id,
+      p_pdf_id: tokenData.pdf_id,
+    });
+
+    if (accessError) {
+      console.error("Access check error:", accessError);
+      return new Response(
+        JSON.stringify({ error: "Erreur lors de la vérification des droits d'accès" }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    if (!hasAccess) {
+      return new Response(
+        JSON.stringify({
+          error: "Accès refusé",
+          reason: "Votre abonnement ne permet pas d'accéder à cette édition.",
+        }),
+        { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
     let suspiciousActivity = false;
     let suspiciousReason = "";
+
+    const fingerprintJson = deviceFingerprint ? JSON.stringify(deviceFingerprint) : null;
+    const allowedDevices = Math.max(1, userData.devices_autorises ?? 2);
+
+    const parseStoredFingerprints = (raw: string | null): string[] => {
+      if (!raw) return [];
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          return parsed.filter((entry): entry is string => typeof entry === "string" && entry.length > 0);
+        }
+      } catch {
+        // raw is not a JSON array, treat it as a single entry string
+      }
+      return raw.trim().length > 0 ? [raw] : [];
+    };
+
+    const storedFingerprints = parseStoredFingerprints(tokenData.device_fingerprint as string | null);
+    let fingerprintList = [...storedFingerprints];
+    let fingerprintChanged = false;
+
+    if (fingerprintJson) {
+      if (fingerprintList.length === 0) {
+        fingerprintList = [fingerprintJson];
+        fingerprintChanged = true;
+      } else if (!fingerprintList.includes(fingerprintJson)) {
+        if (fingerprintList.length >= allowedDevices) {
+          suspiciousActivity = true;
+          suspiciousReason = "Nombre maximum d'appareils atteint";
+
+          await supabaseClient.from("acces_suspects").insert({
+            user_id: tokenData.user_id,
+            token_id: tokenData.id,
+            type_alerte: "device_multiple",
+            description: `Tentative d'acces depuis un nouvel appareil non autorise. Appareils deja enregistres: ${fingerprintList.join(" || ")}`,
+            severity: "critical",
+            data: {
+              authorized_devices: fingerprintList,
+              new_device: deviceFingerprint,
+              ip_address: ipAddress,
+            },
+          });
+
+          await supabaseClient
+            .from("tokens")
+            .update({
+              revoked: true,
+              revoked_reason: "Nombre maximum d'appareils atteint",
+            })
+            .eq("id", tokenData.id);
+
+          return new Response(
+            JSON.stringify({
+              error: "Acces refuse",
+              reason: "Ce lien a ete desactive car le nombre maximum d'appareils autorises a ete atteint.",
+            }),
+            { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+          );
+        }
+
+        fingerprintList.push(fingerprintJson);
+        fingerprintChanged = true;
+      }
+    }
 
     if (tokenData.ip_addresses && ipAddress) {
       const ipList = tokenData.ip_addresses as string[];
@@ -139,9 +230,10 @@ Deno.serve(async (req: Request) => {
 
     if (!tokenData.first_access_at) {
       updateData.first_access_at = new Date().toISOString();
-      if (deviceFingerprint) {
-        updateData.device_fingerprint = JSON.stringify(deviceFingerprint);
-      }
+    }
+
+    if (fingerprintChanged || (!tokenData.device_fingerprint && fingerprintList.length > 0)) {
+      updateData.device_fingerprint = JSON.stringify(fingerprintList);
     }
 
     if (ipAddress) {

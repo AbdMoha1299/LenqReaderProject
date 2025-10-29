@@ -65,7 +65,9 @@ export function ReaderRouter({ token }: ReaderRouterProps) {
       const data = await response.json();
 
       if (!response.ok || data.error) {
-        setError(data.error || 'Token invalide');
+        const reason = typeof data.reason === 'string' ? data.reason : '';
+        const baseError = data.error || 'Token invalide';
+        setError(reason ? `${baseError} : ${reason}` : baseError);
         return;
       }
 

@@ -1,311 +1,230 @@
 import { supabase } from './supabase';
 import { normalizePhoneNumber } from './otp';
 
-export interface SubscriptionFormData {
+const FUNCTIONS_BASE = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1`;
+const DEFAULT_HEADERS = {
+  'Content-Type': 'application/json',
+  Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+};
+
+export interface StartSignupPayload {
   nom: string;
   numero_whatsapp: string;
-  email: string;
   formule_id: string;
+  country_code?: string;
 }
 
-export interface ExistingUserCheck {
-  exists: boolean;
-  verified: boolean;
-  userId?: string;
-  shouldResendOtp?: boolean;
-  shouldRecreate?: boolean;
-  createdAt?: string;
-}
-
-export interface SendOTPResult {
+export interface StartSignupResponse {
   success: boolean;
   error?: string;
-  message: string;
-  userId?: string;
+  message?: string;
+  intentId?: string;
+  retryAfter?: number | null;
+  expiresInSeconds?: number | null;
 }
 
-export interface VerifyOTPResult {
+export interface VerifyOtpResponse {
   success: boolean;
   error?: string;
-  message: string;
+  message?: string;
   userId?: string;
+  intentId?: string;
+  requiresPassword?: boolean;
   attemptsRemaining?: number;
 }
 
-export async function checkExistingUser(phoneNumber: string): Promise<ExistingUserCheck> {
+export interface CompleteSignupResponse {
+  success: boolean;
+  error?: string;
+  message?: string;
+  intentId?: string;
+  userId?: string;
+  authEmail?: string;
+  phone?: string;
+}
+
+export interface CreatePaymentSessionResponse {
+  success: boolean;
+  error?: string;
+  message?: string;
+  mode?: 'free_trial' | 'payment';
+  paymentId?: string;
+  transactionId?: string;
+  amount?: number;
+  publicKey?: string;
+  environment?: string;
+  redirectUrl?: string;
+  callbackUrl?: string;
+}
+
+function phoneToDigits(phone: string): string {
+  return phone.replace(/\D/g, '');
+}
+
+export function phoneToAuthEmail(phone: string): string {
+  const digits = phoneToDigits(phone);
+  return `${digits}@reader.phone`;
+}
+
+async function callFunction<T>(
+  name: string,
+  payload: Record<string, unknown>
+): Promise<{ status: number } & Record<string, any>> {
+  const response = await fetch(`${FUNCTIONS_BASE}/${name}`, {
+    method: 'POST',
+    headers: DEFAULT_HEADERS,
+    body: JSON.stringify(payload),
+  });
+
+  const data = await response.json();
+  return { status: response.status, ...data };
+}
+
+export async function startSignup(payload: StartSignupPayload): Promise<StartSignupResponse> {
   try {
-    const formattedPhone = normalizePhoneNumber(phoneNumber);
+    const formattedPhone = normalizePhoneNumber(payload.numero_whatsapp);
+    const result = await callFunction<any>('send-otp', {
+      numero_whatsapp: formattedPhone,
+      nom: payload.nom,
+      country_code: payload.country_code,
+      formule_id: payload.formule_id,
+    });
 
-    const { data: existingUser, error } = await supabase
-      .from('users')
-      .select('id, whatsapp_verifie, created_at')
-      .eq('numero_whatsapp', formattedPhone)
-      .maybeSingle();
-
-    if (error) {
-      console.error('Error checking existing user:', error);
-      throw error;
-    }
-
-    if (!existingUser) {
-      return { exists: false, verified: false };
-    }
-
-    if (existingUser.whatsapp_verifie) {
+    if (!result.success) {
       return {
-        exists: true,
-        verified: true,
-        userId: existingUser.id,
+        success: false,
+        error: result.error,
+        message: result.message,
+        retryAfter: result.retry_after ?? null,
       };
     }
 
-    const createdAt = new Date(existingUser.created_at);
-    const now = new Date();
-    const minutesSinceCreation = (now.getTime() - createdAt.getTime()) / (1000 * 60);
-
-    if (minutesSinceCreation < 10) {
-      return {
-        exists: true,
-        verified: false,
-        userId: existingUser.id,
-        shouldResendOtp: true,
-        createdAt: existingUser.created_at,
-      };
-    } else {
-      return {
-        exists: true,
-        verified: false,
-        userId: existingUser.id,
-        shouldRecreate: true,
-        createdAt: existingUser.created_at,
-      };
-    }
+    return {
+      success: true,
+      message: result.message,
+      intentId: result.intent_id,
+      retryAfter: result.retry_after ?? null,
+      expiresInSeconds: result.expires_in_seconds ?? null,
+    };
   } catch (error) {
-    console.error('Error in checkExistingUser:', error);
+    console.error('[startSignup] unexpected error', error);
+    return {
+      success: false,
+      error: 'network_error',
+      message: 'Impossible de démarrer la procédure. Vérifiez votre connexion.',
+    };
+  }
+}
+
+export async function verifySignupOtp(intentId: string, otpCode: string): Promise<VerifyOtpResponse> {
+  try {
+    const result = await callFunction<any>('verify-otp', {
+      intent_id: intentId,
+      otp_code: otpCode,
+    });
+
+    if (!result.success) {
+      return {
+        success: false,
+        error: result.error,
+        message: result.message,
+        attemptsRemaining: result.attempts_remaining,
+      };
+    }
+
+    return {
+      success: true,
+      message: result.message,
+      userId: result.user_id,
+      intentId: result.intent_id,
+      requiresPassword: result.requires_password ?? true,
+    };
+  } catch (error) {
+    console.error('[verifySignupOtp] unexpected error', error);
+    return {
+      success: false,
+      error: 'network_error',
+      message: 'Impossible de vérifier le code. Vérifiez votre connexion.',
+    };
+  }
+}
+
+export async function completeSignup(
+  intentId: string,
+  password: string
+): Promise<CompleteSignupResponse> {
+  try {
+    const result = await callFunction<any>('complete-signup', {
+      intent_id: intentId,
+      password,
+    });
+
+    if (!result.success) {
+      return {
+        success: false,
+        error: result.error,
+        message: result.message,
+      };
+    }
+
+    return {
+      success: true,
+      intentId: result.intent_id,
+      userId: result.user_id,
+      authEmail: result.auth_email,
+      phone: result.phone,
+    };
+  } catch (error) {
+    console.error('[completeSignup] unexpected error', error);
+    return {
+      success: false,
+      error: 'network_error',
+      message: 'Impossible de créer votre mot de passe. Vérifiez votre connexion.',
+    };
+  }
+}
+
+export async function createPaymentSession(intentId: string): Promise<CreatePaymentSessionResponse> {
+  try {
+    const result = await callFunction<any>('create-payment', { intent_id: intentId });
+
+    if (!result.success) {
+      return {
+        success: false,
+        error: result.error,
+        message: result.message,
+      };
+    }
+
+    return {
+      success: true,
+      mode: result.mode ?? 'payment',
+      paymentId: result.payment_id,
+      transactionId: result.transaction_id,
+      amount: result.amount,
+      publicKey: result.public_key,
+      environment: result.environment,
+      redirectUrl: result.redirect_url,
+      callbackUrl: result.callback_url,
+      message: result.message,
+    };
+  } catch (error) {
+    console.error('[createPaymentSession] unexpected error', error);
+    return {
+      success: false,
+      error: 'network_error',
+      message: 'Impossible de préparer le paiement. Vérifiez votre connexion.',
+    };
+  }
+}
+
+export async function signInAfterCompletion(identifier: string, password: string) {
+  const { error } = await supabase.auth.signInWithPassword({
+    email: identifier,
+    password,
+  });
+
+  if (error) {
     throw error;
-  }
-}
-
-export async function cleanupUnverifiedUser(userId: string): Promise<boolean> {
-  try {
-    const { data, error } = await supabase.rpc('cleanup_specific_unverified_user', {
-      p_user_id: userId,
-    });
-
-    if (error) {
-      console.error('Error cleaning up unverified user:', error);
-      return false;
-    }
-
-    return data?.success || false;
-  } catch (error) {
-    console.error('Error in cleanupUnverifiedUser:', error);
-    return false;
-  }
-}
-
-export async function cleanupUnverifiedUserByPhone(phoneNumber: string): Promise<boolean> {
-  try {
-    const { data, error } = await supabase.rpc('cleanup_unverified_user_by_phone', {
-      p_phone_number: phoneNumber,
-    });
-
-    if (error) {
-      console.error('Error cleaning up unverified user by phone:', error);
-      return false;
-    }
-
-    return data?.success || false;
-  } catch (error) {
-    console.error('Error in cleanupUnverifiedUserByPhone:', error);
-    return false;
-  }
-}
-
-export async function createUserAccount(formData: SubscriptionFormData): Promise<SendOTPResult> {
-  try {
-    const formattedPhone = normalizePhoneNumber(formData.numero_whatsapp);
-
-    const tempPassword = `temp-${Date.now()}-${Math.random()}`;
-
-    const { data: authData, error: authError } = await supabase.auth.signUp({
-      email: formData.email,
-      password: tempPassword,
-    });
-
-    if (authError) {
-      console.error('Error creating auth account:', authError);
-      throw authError;
-    }
-
-    if (!authData.user) {
-      throw new Error('Erreur lors de la création du compte temporaire');
-    }
-
-    const { data: newUser, error: insertError } = await supabase
-      .from('users')
-      .insert({
-        id: authData.user.id,
-        nom: formData.nom,
-        numero_whatsapp: formattedPhone,
-        email: formData.email,
-        whatsapp_verifie: false,
-        role: 'lecteur',
-        statut_abonnement: 'inactif',
-        score_confiance: 100,
-        devices_autorises: 1,
-      })
-      .select('id')
-      .single();
-
-    if (insertError) {
-      console.error('Error creating user:', insertError);
-      throw insertError;
-    }
-
-    return {
-      success: true,
-      message: 'Compte créé avec succès',
-      userId: newUser.id,
-    };
-  } catch (error: any) {
-    console.error('Error in createUserAccount:', error);
-    return {
-      success: false,
-      error: 'database_error',
-      message: error?.message || 'Erreur lors de la création du compte',
-    };
-  }
-}
-
-export async function sendOTP(phoneNumber: string): Promise<SendOTPResult> {
-  try {
-    const formattedPhone = normalizePhoneNumber(phoneNumber);
-
-    const response = await fetch(
-      `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/send-otp`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
-        },
-        body: JSON.stringify({
-          numero_whatsapp: formattedPhone,
-        }),
-      }
-    );
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      return {
-        success: false,
-        error: data.error || 'otp_send_failed',
-        message: data.message || "Erreur lors de l'envoi du code OTP",
-      };
-    }
-
-    if (!data.success) {
-      return {
-        success: false,
-        error: data.error || 'otp_send_failed',
-        message: data.message || "Erreur lors de l'envoi du code OTP",
-      };
-    }
-
-    return {
-      success: true,
-      message: data.message || 'Code OTP envoyé avec succès',
-    };
-  } catch (error) {
-    console.error('Error sending OTP:', error);
-    return {
-      success: false,
-      error: 'network_error',
-      message: 'Erreur de connexion',
-    };
-  }
-}
-
-export async function verifyOTP(phoneNumber: string, otpCode: string): Promise<VerifyOTPResult> {
-  try {
-    const formattedPhone = normalizePhoneNumber(phoneNumber);
-
-    const response = await fetch(
-      `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/verify-otp`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
-        },
-        body: JSON.stringify({
-          numero_whatsapp: formattedPhone,
-          otp_code: otpCode,
-        }),
-      }
-    );
-
-    const data = await response.json();
-
-    if (!response.ok || !data.success) {
-      return {
-        success: false,
-        error: data.error || 'verification_failed',
-        message: data.message || 'Code OTP invalide',
-        attemptsRemaining: data.attempts_remaining,
-      };
-    }
-
-    return {
-      success: true,
-      message: 'Numéro WhatsApp vérifié avec succès',
-      userId: data.user_id,
-    };
-  } catch (error) {
-    console.error('Error verifying OTP:', error);
-    return {
-      success: false,
-      error: 'network_error',
-      message: 'Erreur de connexion',
-    };
-  }
-}
-
-export async function handleSignupFlow(formData: SubscriptionFormData): Promise<SendOTPResult> {
-  try {
-    const userCheck = await checkExistingUser(formData.numero_whatsapp);
-
-    if (userCheck.verified) {
-      return {
-        success: false,
-        error: 'already_registered',
-        message: 'Ce numéro WhatsApp est déjà enregistré. Veuillez vous connecter.',
-      };
-    }
-
-    if (userCheck.shouldRecreate && userCheck.userId) {
-      await cleanupUnverifiedUser(userCheck.userId);
-      const createResult = await createUserAccount(formData);
-      if (!createResult.success) {
-        return createResult;
-      }
-    } else if (!userCheck.exists) {
-      const createResult = await createUserAccount(formData);
-      if (!createResult.success) {
-        return createResult;
-      }
-    }
-
-    const otpResult = await sendOTP(formData.numero_whatsapp);
-    return otpResult;
-  } catch (error) {
-    console.error('Error in handleSignupFlow:', error);
-    return {
-      success: false,
-      error: 'flow_error',
-      message: 'Une erreur est survenue lors de la création du compte',
-    };
   }
 }

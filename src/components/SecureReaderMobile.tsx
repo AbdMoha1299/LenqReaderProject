@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { AlertCircle, Lock, ChevronLeft, ChevronRight, Maximize, Minimize, BookOpen } from 'lucide-react';
 import { supabase } from '../lib/supabase';
+import { ensurePromiseWithResolvers } from '../utils/ensurePromiseWithResolvers';
 import { ArticleView } from './ArticleView';
 
 interface SecureReaderProps {
@@ -48,6 +49,7 @@ export function SecureReader({ token }: SecureReaderProps) {
   const pinchDistance = useRef<number>(0);
 
   useEffect(() => {
+    ensurePromiseWithResolvers();
     validateToken();
     const newSessionId = crypto.randomUUID();
     setSessionId(newSessionId);
@@ -98,10 +100,10 @@ export function SecureReader({ token }: SecureReaderProps) {
     if (pdfUrl && tokenData) {
       if (!window.pdfjsLib) {
         const script = document.createElement('script');
-        script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+        script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.js';
         script.onload = () => {
           if (window.pdfjsLib) {
-            window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+            window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.js';
             loadPDF();
           }
         };
@@ -199,7 +201,7 @@ export function SecureReader({ token }: SecureReaderProps) {
     try {
       const loadingTask = window.pdfjsLib.getDocument({
         url: pdfUrl,
-        cMapUrl: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/cmaps/',
+        cMapUrl: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/cmaps/',
         cMapPacked: true,
         disableAutoFetch: true,
         disableStream: false,
