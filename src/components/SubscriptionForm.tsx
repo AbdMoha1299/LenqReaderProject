@@ -51,6 +51,7 @@ export function SubscriptionForm() {
 
   const [paymentSession, setPaymentSession] = useState<PaymentSession | null>(null);
   const [ipayScriptLoaded, setIpayScriptLoaded] = useState(false);
+  const [openingPayment, setOpeningPayment] = useState(false);
 
   useEffect(() => {
     if (formuleId) {
@@ -87,7 +88,7 @@ export function SubscriptionForm() {
     script.dataset.ipaySdk = 'true';
     script.onload = () => setIpayScriptLoaded(true);
     script.onerror = () => {
-      setError("Impossible de charger le module iPay. Veuillez réessayer ultérieurement.");
+      setError("Impossible de charger le module iPay. Veuillez ressayer ultrieurement.");
       setPaymentSession(null);
     };
     document.body.appendChild(script);
@@ -114,15 +115,15 @@ export function SubscriptionForm() {
 
   const validateForm = () => {
     if (!formule) {
-      setError('Veuillez sélectionner une formule');
+      setError('Veuillez slectionner une formule');
       return false;
     }
     if (!formData.nom || formData.nom.length < 2) {
-      setError('Veuillez entrer un nom valide (minimum 2 caractères)');
+      setError('Veuillez entrer un nom valide (minimum 2 caractres)');
       return false;
     }
     if (!validatePhoneNumber(formData.numero_whatsapp)) {
-      setError('Veuillez entrer un numéro WhatsApp valide (format international)');
+      setError('Veuillez entrer un numro WhatsApp valide (format international)');
       return false;
     }
     return true;
@@ -148,7 +149,7 @@ export function SubscriptionForm() {
       });
 
       if (!response.success || !response.intentId) {
-        setError(response.message || "Impossible d'envoyer le code OTP. Veuillez réessayer.");
+        setError(response.message || "Impossible d'envoyer le code OTP. Veuillez ressayer.");
         return;
       }
 
@@ -179,8 +180,8 @@ export function SubscriptionForm() {
 
       setStep(result.requiresPassword === false ? 'payment' : 'password');
     } catch (err: any) {
-      console.error('Erreur vérification OTP:', err);
-      setError(err.message || 'Vérification impossible. Réessayez.');
+      console.error('Erreur vrification OTP:', err);
+      setError(err.message || 'Vrification impossible. Ressayez.');
     } finally {
       setProcessing(false);
     }
@@ -190,7 +191,7 @@ export function SubscriptionForm() {
     setIntentId(null);
     setNormalizedPhone(null);
     setOtpSecondsRemaining(null);
-    setError('Inscription annulée. Vous pouvez recommencer.');
+    setError('Inscription annule. Vous pouvez recommencer.');
     setStep('form');
   };
 
@@ -205,7 +206,7 @@ export function SubscriptionForm() {
     }
 
     if (password.length < 8) {
-      setError('Le mot de passe doit contenir au minimum 8 caractères.');
+      setError('Le mot de passe doit contenir au minimum 8 caractres.');
       return;
     }
 
@@ -218,15 +219,15 @@ export function SubscriptionForm() {
     try {
       const completion = await completeSignup(intentId, password);
       if (!completion.success || !completion.authEmail) {
-        setError(completion.message || "Erreur lors de la création du compte.");
+        setError(completion.message || "Erreur lors de la cration du compte.");
         return;
       }
 
       await signInAfterCompletion(completion.authEmail, password);
       setStep('payment');
     } catch (err: any) {
-      console.error('Erreur création mot de passe:', err);
-      setError(err.message || 'Impossible de créer votre compte. Réessayez.');
+      console.error('Erreur cration mot de passe:', err);
+      setError(err.message || 'Impossible de crer votre compte. Ressayez.');
     } finally {
       setProcessing(false);
     }
@@ -242,15 +243,15 @@ export function SubscriptionForm() {
     try {
       const result = await createPaymentSession(intentId);
       if (!result.success) {
-        setError(result.message || 'Le paiement a échoué. Réessayez.');
+        setError(result.message || 'Le paiement a chou. Ressayez.');
         return;
       }
 
       if (result.mode === 'free_trial') {
         setSuccessMessage(
           formule.essai_gratuit
-            ? 'Votre période gratuite est active. Vous pouvez accéder à vos éditions.'
-            : 'Paiement confirmé. Vous pouvez accéder à vos éditions.'
+            ? 'Votre priode gratuite est active. Vous pouvez accder  vos ditions.'
+            : 'Paiement confirm. Vous pouvez accder  vos ditions.'
         );
         setStep('success');
         return;
@@ -262,7 +263,7 @@ export function SubscriptionForm() {
         !result.publicKey ||
         typeof result.amount !== 'number'
       ) {
-        setError("Impossible de préparer la transaction iPay. Veuillez réessayer.");
+        setError("Impossible de prparer la transaction iPay. Veuillez ressayer.");
         return;
       }
 
@@ -277,10 +278,133 @@ export function SubscriptionForm() {
       });
       setStep('payment');
     } catch (err: any) {
-      console.error('Erreur préparation paiement:', err);
+      console.error('Erreur prparation paiement:', err);
       setError(err.message || 'Une erreur est survenue lors du paiement');
     } finally {
       setProcessing(false);
+    }
+  };
+
+  const openIpayOverlay = (token: string) => {
+    const existingOverlay = document.querySelector<HTMLDivElement>('.ipaymoney-payment-page');
+    if (existingOverlay) {
+      existingOverlay.remove();
+    }
+
+    const overlay = document.createElement('div');
+    overlay.className = 'ipaymoney-payment-page';
+    overlay.setAttribute(
+      'style',
+      'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0, 0, 0, 0.50); z-index: 999999;'
+    );
+    document.body.appendChild(overlay);
+
+    const container = document.createElement('div');
+    container.setAttribute('style', 'position: relative; width: 100%; height: 100%; margin: 0 auto;');
+    overlay.appendChild(container);
+
+    const loader = document.createElement('div');
+    loader.setAttribute(
+      'style',
+      [
+        'position: absolute',
+        'width: 50px',
+        'height: 50px',
+        'top: 50%',
+        'left: 50%',
+        'transform: translate(-50%, -50%)',
+        'z-index: 9999999',
+        'border: 4px solid #fdffde',
+        'border-radius: 50%',
+        'border-top: 4px solid #a6bd2e',
+        'border-bottom: 4px solid #a5be2e',
+        'animation: spin 2s linear infinite',
+      ].join('; ')
+    );
+    container.appendChild(loader);
+
+    const animation = loader.animate(
+      [
+        { transform: 'rotate(0deg)' },
+        { transform: 'rotate(360deg)' },
+      ],
+      {
+        duration: 2000,
+        iterations: Infinity,
+        easing: 'linear',
+      }
+    );
+
+    const iframe = document.createElement('iframe');
+    iframe.setAttribute('style', 'display: none');
+    iframe.onload = () => {
+      iframe.setAttribute('style', 'border: 0; width: 100%; height: 100%; display: block;');
+      loader.style.display = 'none';
+      animation.cancel();
+    };
+    iframe.onerror = () => {
+      console.error('Erreur de chargement de la fenetre iPay');
+    };
+    container.appendChild(iframe);
+
+    const sdkUrl = `https://i-pay.money/api/sdk/payment_pages?token=${token}`;
+    iframe.src = sdkUrl;
+    iframe.width = '100%';
+    iframe.height = '100%';
+    iframe.frameBorder = '0';
+    iframe.id = 'i-pay-frame';
+  };
+
+  const handleIpayButtonClick = async () => {
+    if (!paymentSession || !ipayScriptLoaded || openingPayment) {
+      return;
+    }
+
+    setOpeningPayment(true);
+    setError('');
+
+    try {
+      const redirect = paymentSession.redirectUrl?.trim() ?? '';
+      const callback = paymentSession.callbackUrl?.trim() ?? '';
+
+      const globalWindow = window as typeof window & {
+        redirectUrl?: string;
+        callbackUrl?: string;
+        iPaymoneySdk?: string;
+        isPaymentPage?: boolean;
+      };
+
+      globalWindow.redirectUrl = redirect || undefined;
+      globalWindow.callbackUrl = callback || undefined;
+      globalWindow.iPaymoneySdk = 'react';
+
+      const response = await fetch('https://i-pay.money/api/sdk/payment_pages/create_payment_token', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          key: paymentSession.publicKey,
+          amount: String(paymentSession.amount ?? 0),
+          environement: paymentSession.environment ?? 'live',
+          transaction_id: paymentSession.transactionId,
+          parent_domaine: window.location.origin,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok || !data?.token) {
+        throw new Error('unable_to_create_payment_token');
+      }
+
+      openIpayOverlay(data.token);
+      globalWindow.isPaymentPage = true;
+    } catch (err) {
+      console.error('Erreur ouverture iPay:', err);
+      setError("Impossible d'ouvrir la fenetre de paiement. Veuillez reessayer.");
+    } finally {
+      setOpeningPayment(false);
     }
   };
 
@@ -297,13 +421,13 @@ export function SubscriptionForm() {
       <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-gray-900 via-gray-800 to-black p-4">
         <div className="bg-gray-800 border border-green-700 rounded-lg p-8 text-center max-w-md">
           <CheckCircle className="w-12 h-12 text-green-500 mx-auto mb-4" />
-          <h2 className="text-2xl font-bold text-white mb-4">Inscription réussie !</h2>
+          <h2 className="text-2xl font-bold text-white mb-4">Inscription russie !</h2>
           <p className="text-gray-300">{successMessage}</p>
           <button
             onClick={() => navigate('/reader')}
             className="mt-6 inline-flex items-center gap-2 px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-black font-semibold rounded-lg"
           >
-            Accéder à mes éditions
+            Accder  mes ditions
           </button>
         </div>
       </div>
@@ -317,7 +441,7 @@ export function SubscriptionForm() {
           <div className="flex items-center gap-3">
             <Newspaper className="w-8 h-8 text-amber-500" />
             <div>
-              <h1 className="text-2xl font-bold text-white">L'Enquêteur</h1>
+              <h1 className="text-2xl font-bold text-white">L'Enquteur</h1>
               <p className="text-xs text-gray-400">Inscription</p>
             </div>
           </div>
@@ -349,11 +473,11 @@ export function SubscriptionForm() {
         <div className="bg-gray-800 border border-gray-700 rounded-lg p-8">
           <h2 className="text-2xl font-bold text-white mb-6">
             {step === 'form'
-              ? 'Créer mon compte'
+              ? 'Crer mon compte'
               : step === 'otp'
-              ? 'Vérification du numéro'
+              ? 'Vrification du numro'
               : step === 'password'
-              ? 'Sécurisez votre compte'
+              ? 'Scurisez votre compte'
               : 'Finaliser mon paiement'}
           </h2>
 
@@ -381,7 +505,7 @@ export function SubscriptionForm() {
 
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2">
-                  <Phone className="inline w-4 h-4 mr-2" /> Numéro WhatsApp
+                  <Phone className="inline w-4 h-4 mr-2" /> Numro WhatsApp
                 </label>
                 <input
                   type="tel"
@@ -392,7 +516,7 @@ export function SubscriptionForm() {
                   required
                 />
                 <p className="text-gray-500 text-xs mt-1">
-                  Format international requis (ex : +227 pour le Niger). Ce numéro sera votre identifiant.
+                  Format international requis (ex : +227 pour le Niger). Ce numro sera votre identifiant.
                 </p>
               </div>
 
@@ -414,7 +538,7 @@ export function SubscriptionForm() {
 
           {step === 'otp' && intentId && (
             <div className="space-y-6 text-center">
-              <p className="text-gray-300">Code envoyé à</p>
+              <p className="text-gray-300">Code envoy </p>
               <p className="text-white font-semibold">{formData.numero_whatsapp}</p>
               <p className="text-sm text-gray-400">
                 Ce code est valable {otpSecondsRemaining ? Math.max(1, Math.floor(otpSecondsRemaining / 60)) : 10} minute(s).
@@ -428,7 +552,7 @@ export function SubscriptionForm() {
               </button>
 
               <label className="block text-sm text-gray-300 mt-4">
-                Entrez le code de vérification
+                Entrez le code de vrification
               </label>
               <OTPInput
                 length={6}
@@ -437,7 +561,7 @@ export function SubscriptionForm() {
                 error={error}
                 expiryMinutes={10}
                 onExpiry={() => {
-                  setError('Code OTP expiré. Veuillez recommencer.');
+                  setError('Code OTP expir. Veuillez recommencer.');
                   setStep('form');
                   setIntentId(null);
                   setOtpSecondsRemaining(null);
@@ -450,8 +574,8 @@ export function SubscriptionForm() {
             <form onSubmit={handlePasswordSubmit} className="space-y-5">
               <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-sm text-gray-300">
                 <p>
-                  Votre numéro <span className="text-white font-semibold">{formData.numero_whatsapp}</span> sera votre identifiant de connexion.
-                  Choisissez un mot de passe pour sécuriser l’accès à votre espace lecteur.
+                  Votre numro <span className="text-white font-semibold">{formData.numero_whatsapp}</span> sera votre identifiant de connexion.
+                  Choisissez un mot de passe pour scuriser laccs  votre espace lecteur.
                 </p>
               </div>
 
@@ -464,7 +588,7 @@ export function SubscriptionForm() {
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white focus:ring-2 focus:ring-amber-500"
-                  placeholder="Minimum 8 caractères"
+                  placeholder="Minimum 8 caractres"
                   required
                   minLength={8}
                 />
@@ -492,10 +616,10 @@ export function SubscriptionForm() {
               >
                 {processing ? (
                   <>
-                    <Loader className="w-5 h-5 animate-spin" /> Création du compte...
+                    <Loader className="w-5 h-5 animate-spin" /> Cration du compte...
                   </>
                 ) : (
-                  'Créer mon mot de passe'
+                  'Crer mon mot de passe'
                 )}
               </button>
             </form>
@@ -505,11 +629,11 @@ export function SubscriptionForm() {
             <div className="space-y-6">
               <div className="bg-gray-900/60 border border-gray-700 rounded-lg p-4 text-sm text-gray-300">
                 <p>
-                  Connecté en tant que{' '}
+                  Connect en tant que{' '}
                   <span className="text-white font-semibold">
                     {formData.numero_whatsapp}
                   </span>
-                  . Vous pouvez à tout moment vous reconnecter avec ce numéro et votre mot de passe.
+                  . Vous pouvez  tout moment vous reconnecter avec ce numro et votre mot de passe.
                 </p>
               </div>
 
@@ -522,7 +646,7 @@ export function SubscriptionForm() {
                 >
                   {processing ? (
                     <>
-                      <Loader className="w-5 h-5 animate-spin" /> Préparation du paiement...
+                      <Loader className="w-5 h-5 animate-spin" /> Prparation du paiement...
                     </>
                   ) : (
                     `Payer ${formule.prix_fcfa?.toLocaleString()} FCFA`
@@ -533,23 +657,30 @@ export function SubscriptionForm() {
               {paymentSession && (
                 <div className="space-y-4 text-center">
                   <div className="bg-blue-900/30 border border-blue-700 text-blue-100 px-4 py-3 rounded-lg text-sm">
-                    Une fenêtre sécurisée iPay va s’ouvrir. Terminez le paiement puis revenez sur cette page.
+                    Une fenetre securisee iPay va s'ouvrir. Terminez le paiement puis revenez sur cette page.
                   </div>
                   <button
                     type="button"
                     className="ipaymoney-button px-6 py-3 rounded-lg font-semibold bg-gradient-to-r from-purple-500 to-indigo-500 text-white shadow-lg disabled:opacity-50 disabled:cursor-not-allowed"
                     data-amount={String(paymentSession.amount ?? 0)}
                     data-environement={paymentSession.environment}
+                    data-environment={paymentSession.environment}
                     data-key={paymentSession.publicKey}
                     data-transaction-id={paymentSession.transactionId}
                     data-redirect-url={paymentSession.redirectUrl}
                     data-callback-url={paymentSession.callbackUrl}
-                    disabled={!ipayScriptLoaded}
+                    data-sdk="react"
+                    onClick={handleIpayButtonClick}
+                    disabled={!ipayScriptLoaded || openingPayment}
                   >
-                    {ipayScriptLoaded ? 'Ouvrir la fenêtre de paiement' : 'Chargement du module iPay...'}
+                    {openingPayment
+                      ? 'Ouverture de la fenetre de paiement...'
+                      : ipayScriptLoaded
+                        ? 'Ouvrir la fenetre de paiement'
+                        : 'Chargement du module iPay...'}
                   </button>
                   <p className="text-xs text-gray-500">
-                    Référence :{' '}
+                    Reference :{' '}
                     <span className="font-mono text-gray-300">{paymentSession.transactionId}</span>
                   </p>
                 </div>
@@ -561,3 +692,4 @@ export function SubscriptionForm() {
     </div>
   );
 }
+
