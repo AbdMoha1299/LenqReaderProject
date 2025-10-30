@@ -43,12 +43,10 @@ const corsHeaders = {
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
-const ipayPublicKey = Deno.env.get("IPAY_PUBLIC_KEY") ?? Deno.env.get("VITE_IPAY_PUBLIC_KEY") ?? "";
-const ipayEnvironment = Deno.env.get("IPAY_ENVIRONMENT") ?? Deno.env.get("VITE_IPAY_ENVIRONMENT") ?? "live";
-const ipayRedirectUrl =
-  Deno.env.get("IPAY_REDIRECT_URL") ?? Deno.env.get("VITE_IPAY_REDIRECT_URL") ?? `${supabaseUrl}/payment-status`;
-const ipayCallbackUrl =
-  Deno.env.get("IPAY_CALLBACK_URL") ?? Deno.env.get("VITE_IPAY_CALLBACK_URL") ?? `${supabaseUrl}/functions/v1/ipay-webhook`;
+const ipayPublicKey = Deno.env.get("IPAY_PUBLIC_KEY") ?? "";
+const ipayEnvironment = Deno.env.get("IPAY_ENVIRONMENT") ?? "live";
+const ipayRedirectUrl = Deno.env.get("IPAY_REDIRECT_URL") ?? "";
+const ipayCallbackUrl = Deno.env.get("IPAY_CALLBACK_URL") ?? "";
 
 if (!supabaseUrl || !supabaseServiceKey) {
   console.warn("[create-payment] Missing Supabase credentials in environment variables.");
@@ -56,6 +54,14 @@ if (!supabaseUrl || !supabaseServiceKey) {
 
 if (!ipayPublicKey) {
   console.warn("[create-payment] Missing IPAY_PUBLIC_KEY in environment variables.");
+}
+
+if (!ipayRedirectUrl) {
+  console.warn("[create-payment] Missing IPAY_REDIRECT_URL in environment variables.");
+}
+
+if (!ipayCallbackUrl) {
+  console.warn("[create-payment] Missing IPAY_CALLBACK_URL in environment variables.");
 }
 
 function buildSupabaseClient() {
@@ -211,6 +217,17 @@ Deno.serve(async (req: Request) => {
         success: false,
         error: "configuration_error",
         message: "Clé publique iPay non configurée. Contactez un administrateur.",
+      }),
+      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
+  }
+
+  if (!ipayRedirectUrl || !ipayCallbackUrl) {
+    return new Response(
+      JSON.stringify({
+        success: false,
+        error: "configuration_error",
+        message: "Les URL de redirection ou de rappel iPay ne sont pas configurées.",
       }),
       { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
