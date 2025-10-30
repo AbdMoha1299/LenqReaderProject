@@ -37,6 +37,11 @@ const corsHeaders = {
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+const ipaySecretKey =
+  Deno.env.get("IPAY_SECRET_KEY") ??
+  Deno.env.get("IPAY_WEBHOOK_SECRET") ??
+  Deno.env.get("VITE_IPAY_SECRET_KEY") ??
+  "";
 
 function buildSupabaseClient() {
   return createClient(supabaseUrl, supabaseServiceKey, {
@@ -177,7 +182,7 @@ async function markPaymentFailure(
       .from("signup_intents")
       .update({
         state: "awaiting_payment",
-        last_error: "Le paiement a échoué",
+        last_error: "Le paiement a chou",
         metadata: {
           last_payment_status: payload.status,
           last_payment_error_at: new Date().toISOString(),
@@ -209,24 +214,72 @@ Deno.serve(async (req: Request) => {
       JSON.stringify({
         success: false,
         error: "method_not_allowed",
-        message: "Méthode non supportée",
+        message: "Mthode non supporte",
       }),
       { status: 405, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   }
 
   const supabase = buildSupabaseClient();
+  let rawBody = "";
 
   try {
-    const payload = (await req.json()) as WebhookPayload;
-    console.log("[ipay-webhook] Payload reçu", payload);
+    const incomingSecret =
+      req.headers.get("secret-hash") ??
+      req.headers.get("x-ipaymoney-secret") ??
+      null;
+
+    if (ipaySecretKey) {
+      if (!incomingSecret || incomingSecret !== ipaySecretKey) {
+        console.warn("[ipay-webhook] Secret hash mismatch");
+        return new Response(
+          JSON.stringify({
+            success: false,
+            error: "invalid_signature",
+            message: "Signature du webhook invalide",
+          }),
+          { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+    } else {
+      console.warn("[ipay-webhook] IPAY_SECRET_KEY missing; webhook signature cannot be verified.");
+    }
+
+    rawBody = await req.text();
+    if (!rawBody) {
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: "empty_payload",
+          message: "Corps de requete vide",
+        }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    let payload: WebhookPayload;
+    try {
+      payload = JSON.parse(rawBody) as WebhookPayload;
+    } catch (parseError) {
+      console.error("[ipay-webhook] Invalid JSON payload", parseError, rawBody);
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: "invalid_json",
+          message: "Le corps du webhook n'est pas un JSON valide",
+        }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    console.log("[ipay-webhook] Payload recu", payload);
 
     if (!payload.status || (!payload.reference && !payload.transaction_id && !payload.paiement_id)) {
       return new Response(
         JSON.stringify({
           success: false,
           error: "missing_reference",
-          message: "Référence de paiement ou identifiants manquants",
+          message: "Rfrence de paiement ou identifiants manquants",
         }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
@@ -262,8 +315,8 @@ Deno.serve(async (req: Request) => {
       .eq("id", paiement.id);
 
     if (updateError) {
-      console.error("[ipay-webhook] Erreur mise à jour paiement", updateError);
-      throw new Error(`Erreur lors de la mise à jour du paiement: ${updateError.message}`);
+      console.error("[ipay-webhook] Erreur mise  jour paiement", updateError);
+      throw new Error(`Erreur lors de la mise  jour du paiement: ${updateError.message}`);
     }
 
     await recordPaymentEvent(
@@ -294,7 +347,7 @@ Deno.serve(async (req: Request) => {
     return new Response(
       JSON.stringify({
         success: true,
-        message: "Webhook traité avec succès",
+        message: "Webhook trait avec succs",
         payment_id: paiement.id,
         new_status: newStatus,
       }),
@@ -303,10 +356,19 @@ Deno.serve(async (req: Request) => {
   } catch (error) {
     console.error("[ipay-webhook] Erreur", error);
 
+    let loggedPayload: Record<string, unknown> = {};
+    if (rawBody) {
+      try {
+        loggedPayload = JSON.parse(rawBody);
+      } catch {
+        loggedPayload = { raw: rawBody };
+      }
+    }
+
     await supabase.from("webhook_logs").insert({
       source: "ipay",
       event_type: "payment_status_update",
-      payload: await req.clone().json().catch(() => ({})),
+      payload: loggedPayload,
       status: "error",
       error_message: error instanceof Error ? error.message : String(error),
       processed_at: new Date().toISOString(),
@@ -316,7 +378,6 @@ Deno.serve(async (req: Request) => {
       JSON.stringify({
         error: error instanceof Error ? error.message : "Erreur inconnue",
       }),
-      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   }
