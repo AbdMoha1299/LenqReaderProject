@@ -8,7 +8,6 @@ const corsHeaders = {
 };
 
 const IPAY_API_URL = "https://i-pay.money/api/v1/payments";
-const IPAY_SECRET_KEY = "sk_11a35c3f7ab44dc79e38757fcd28ba82";
 
 interface CheckStatusRequest {
   reference: string;
@@ -42,8 +41,47 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    const ipaySecretKey = Deno.env.get("IPAY_SECRET_KEY");
+    const ipayEnvironment = Deno.env.get("IPAY_ENVIRONMENT") ?? "live";
+
+    if (!supabaseUrl || !supabaseKey) {
+      console.error("Missing Supabase credentials");
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: "configuration_error",
+          message: "Configuration Supabase manquante",
+        }),
+        {
+          status: 500,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+    }
+
+    if (!ipaySecretKey) {
+      console.error("Missing iPay secret key");
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: "configuration_error",
+          message: "Configuration iPay manquante",
+        }),
+        {
+          status: 500,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+    }
+
     const supabase = createClient(supabaseUrl, supabaseKey);
 
     const startTime = Date.now();
@@ -52,8 +90,8 @@ Deno.serve(async (req: Request) => {
       method: "GET",
       headers: {
         "Ipay-Payment-Type": "mobile",
-        "Ipay-Target-Environment": "live",
-        "Authorization": `Bearer ${IPAY_SECRET_KEY}`,
+        "Ipay-Target-Environment": ipayEnvironment,
+        "Authorization": `Bearer ${ipaySecretKey}`,
         "Content-Type": "application/json",
       },
     });
@@ -74,7 +112,7 @@ Deno.serve(async (req: Request) => {
         request_url: `${IPAY_API_URL}/${reference}`,
         request_headers: {
           "Ipay-Payment-Type": "mobile",
-          "Ipay-Target-Environment": "live",
+          "Ipay-Target-Environment": ipayEnvironment,
         },
         request_body: { reference },
         response_status: ipayResponse.status,

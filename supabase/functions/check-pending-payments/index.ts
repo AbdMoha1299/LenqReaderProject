@@ -7,7 +7,6 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
-const IPAY_SECRET_KEY = Deno.env.get("IPAY_SECRET_KEY") ?? "sk_11a35c3f7ab44dc79e38757fcd28ba82";
 const IPAY_API_URL = "https://api.i-pay.money";
 
 Deno.serve(async (req: Request) => {
@@ -16,10 +15,35 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const supabaseClient = createClient(
-      Deno.env.get("SUPABASE_URL") ?? "",
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
-    );
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    const ipaySecretKey = Deno.env.get("IPAY_SECRET_KEY");
+
+    if (!supabaseUrl || !supabaseKey) {
+      console.error("Missing Supabase configuration");
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: "configuration_error",
+          message: "Configuration Supabase manquante",
+        }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    if (!ipaySecretKey) {
+      console.error("Missing iPay secret key");
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: "configuration_error",
+          message: "Configuration iPay manquante",
+        }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    const supabaseClient = createClient(supabaseUrl, supabaseKey);
 
     // Récupérer tous les paiements en attente de moins de 24h
     const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
@@ -65,7 +89,7 @@ Deno.serve(async (req: Request) => {
           {
             method: "GET",
             headers: {
-              "Authorization": `Bearer ${IPAY_SECRET_KEY}`,
+              "Authorization": `Bearer ${ipaySecretKey}`,
               "Content-Type": "application/json",
             },
           }

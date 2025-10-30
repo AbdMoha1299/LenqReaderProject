@@ -8,7 +8,6 @@ const corsHeaders = {
 };
 
 const IPAY_API_URL = "https://i-pay.money/api/v1/payment-links";
-const IPAY_SECRET_KEY = "sk_11a35c3f7ab44dc79e38757fcd28ba82";
 
 interface PaymentLinkRequest {
   customer_name: string;
@@ -29,14 +28,22 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const { customer_name, amount, currency, country, user_id, abonnement_id, description }: PaymentLinkRequest = await req.json();
+    const {
+      customer_name,
+      amount,
+      currency,
+      country,
+      user_id,
+      abonnement_id,
+      description,
+    }: PaymentLinkRequest = await req.json();
 
     if (!customer_name || !amount || !currency || !country || !user_id || !abonnement_id) {
       return new Response(
         JSON.stringify({
           success: false,
           error: "missing_fields",
-          message: "Tous les champs requis doivent être fournis",
+          message: "Tous les champs requis doivent etre fournis",
         }),
         {
           status: 400,
@@ -48,8 +55,46 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    const ipaySecretKey = Deno.env.get("IPAY_SECRET_KEY");
+
+    if (!supabaseUrl || !supabaseKey) {
+      console.error("Missing Supabase configuration");
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: "configuration_error",
+          message: "Configuration Supabase manquante",
+        }),
+        {
+          status: 500,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+    }
+
+    if (!ipaySecretKey) {
+      console.error("Missing iPay secret key");
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: "configuration_error",
+          message: "Configuration iPay manquante",
+        }),
+        {
+          status: 500,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+    }
+
     const supabase = createClient(supabaseUrl, supabaseKey);
 
     const externalReference = `ABN-${abonnement_id}`;
@@ -60,15 +105,15 @@ Deno.serve(async (req: Request) => {
       currency,
       country,
       external_reference: externalReference,
-      description: description || `Abonnement L'Enquêteur - ${customer_name}`,
+      description: description || `Abonnement L'Enqueteur - ${customer_name}`,
     };
 
-    console.log("📤 Creating iPay payment link:", paymentLinkBody);
+    console.log("Creating iPay payment link:", paymentLinkBody);
 
     const ipayResponse = await fetch(IPAY_API_URL, {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${IPAY_SECRET_KEY}`,
+        Authorization: `Bearer ${ipaySecretKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(paymentLinkBody),
@@ -76,7 +121,7 @@ Deno.serve(async (req: Request) => {
 
     const responseData = await ipayResponse.json();
 
-    console.log("📥 iPay payment link response:", {
+    console.log("iPay payment link response:", {
       status: ipayResponse.status,
       ok: ipayResponse.ok,
       data: responseData,
@@ -87,7 +132,7 @@ Deno.serve(async (req: Request) => {
         JSON.stringify({
           success: false,
           error: "payment_link_failed",
-          message: responseData.message || "Erreur lors de la création du lien de paiement",
+          message: responseData.message || "Erreur lors de la creation du lien de paiement",
           details: responseData,
         }),
         {
@@ -112,13 +157,13 @@ Deno.serve(async (req: Request) => {
         country_code: country,
         currency,
         statut: "en_attente",
-        notes: `Payment link created - ${responseData.status || 'pending'}`,
+        notes: `Payment link created - ${responseData.status || "pending"}`,
       })
       .select()
       .single();
 
     if (paiementError) {
-      console.error("❌ Error creating paiement record:", paiementError);
+      console.error("Error creating paiement record:", paiementError);
     }
 
     await supabase.from("payment_api_logs").insert({
@@ -131,13 +176,18 @@ Deno.serve(async (req: Request) => {
       response_time_ms: 0,
     });
 
-    const paymentUrl = responseData.payment_url || responseData.url || responseData.link || responseData.redirect_url || responseData.payment_link;
+    const paymentUrl =
+      responseData.payment_url ||
+      responseData.url ||
+      responseData.link ||
+      responseData.redirect_url ||
+      responseData.payment_link;
 
-    console.log("🔗 Payment URL extracted:", paymentUrl);
-    console.log("📋 Full response data:", JSON.stringify(responseData, null, 2));
+    console.log("Payment URL extracted:", paymentUrl);
+    console.log("Full response data:", JSON.stringify(responseData, null, 2));
 
     if (!paymentUrl) {
-      console.error("❌ No payment URL found in response. Available keys:", Object.keys(responseData));
+      console.error("No payment URL found in response. Available keys:", Object.keys(responseData));
     }
 
     return new Response(
@@ -146,7 +196,7 @@ Deno.serve(async (req: Request) => {
         payment_url: paymentUrl,
         reference: responseData.reference,
         external_reference: externalReference,
-        message: "Lien de paiement créé avec succès",
+        message: "Lien de paiement cree avec succes",
         paiement_id: paiement?.id,
         debug_response: responseData,
       }),
@@ -159,7 +209,7 @@ Deno.serve(async (req: Request) => {
       }
     );
   } catch (error) {
-    console.error("❌ Error in generate-payment-link:", error);
+    console.error("Error in generate-payment-link:", error);
     return new Response(
       JSON.stringify({
         success: false,

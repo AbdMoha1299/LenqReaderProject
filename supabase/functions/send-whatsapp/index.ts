@@ -7,7 +7,6 @@ const corsHeaders = {
 };
 
 const WASENDER_API_URL = "https://wasenderapi.com/api/send-message";
-const WASENDER_API_KEY = "9017ef11b7228c6d68ac651a7878e1ec05ab47247c7e32e007b802118cc5416b";
 
 interface SendMessageRequest {
   to: string;
@@ -47,10 +46,30 @@ Deno.serve(async (req: Request) => {
       );
     }
 
+    const apiKey = Deno.env.get("WASENDER_API_KEY");
+
+    if (!apiKey) {
+      console.error("Missing Wasender API key");
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: "configuration_error",
+          message: "Configuration Wasender manquante",
+        }),
+        {
+          status: 500,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+    }
+
     const response = await fetch(WASENDER_API_URL, {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${WASENDER_API_KEY}`,
+        "Authorization": `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
