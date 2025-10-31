@@ -5,6 +5,7 @@ const FUNCTIONS_BASE = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1`;
 const DEFAULT_HEADERS = {
   'Content-Type': 'application/json',
   Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+  apikey: import.meta.env.VITE_SUPABASE_ANON_KEY,
 };
 
 export interface StartSignupPayload {
@@ -66,7 +67,7 @@ export function phoneToAuthEmail(phone: string): string {
   return `${digits}@reader.phone`;
 }
 
-async function callFunction<T>(
+async function callFunction(
   name: string,
   payload: Record<string, unknown>
 ): Promise<{ status: number } & Record<string, any>> {
@@ -83,7 +84,7 @@ async function callFunction<T>(
 export async function startSignup(payload: StartSignupPayload): Promise<StartSignupResponse> {
   try {
     const formattedPhone = normalizePhoneNumber(payload.numero_whatsapp);
-    const result = await callFunction<any>('send-otp', {
+    const result = await callFunction('send-otp', {
       numero_whatsapp: formattedPhone,
       nom: payload.nom,
       country_code: payload.country_code,
@@ -118,7 +119,7 @@ export async function startSignup(payload: StartSignupPayload): Promise<StartSig
 
 export async function verifySignupOtp(intentId: string, otpCode: string): Promise<VerifyOtpResponse> {
   try {
-    const result = await callFunction<any>('verify-otp', {
+    const result = await callFunction('verify-otp', {
       intent_id: intentId,
       otp_code: otpCode,
     });
@@ -154,7 +155,7 @@ export async function completeSignup(
   password: string
 ): Promise<CompleteSignupResponse> {
   try {
-    const result = await callFunction<any>('complete-signup', {
+    const result = await callFunction('complete-signup', {
       intent_id: intentId,
       password,
     });
@@ -186,7 +187,7 @@ export async function completeSignup(
 
 export async function createPaymentSession(intentId: string): Promise<CreatePaymentSessionResponse> {
   try {
-    const result = await callFunction<any>('create-payment', { intent_id: intentId });
+    const result = await callFunction('create-payment', { intent_id: intentId });
 
     if (!result.success) {
       return {
@@ -228,3 +229,6 @@ export async function signInAfterCompletion(identifier: string, password: string
     throw error;
   }
 }
+
+
+

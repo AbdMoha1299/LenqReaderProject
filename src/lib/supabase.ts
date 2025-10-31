@@ -3,12 +3,28 @@ import { createClient } from '@supabase/supabase-js';
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
+// Vérification de la configuration (sans throw pour ne pas bloquer l'app)
+if (!supabaseUrl || !supabaseAnonKey) {
+  console.error('❌ Configuration Supabase manquante!', {
+    url: supabaseUrl ? '✅ Défini' : '❌ Manquant',
+    key: supabaseAnonKey ? '✅ Défini' : '❌ Manquant',
+    env: import.meta.env,
+  });
+  console.warn('⚠️ Vérifiez que le fichier .env existe et que le serveur a été redémarré');
+} else {
+  console.log('✅ Supabase configuré:', {
+    url: supabaseUrl,
+    keyPrefix: supabaseAnonKey.substring(0, 20) + '...',
+  });
+}
+
 export const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 export interface User {
   id: string;
   nom: string;
   email: string;
+  auth_user_id?: string | null;
   role: 'admin' | 'lecteur';
   created_at: string;
   numero_whatsapp?: string | null;

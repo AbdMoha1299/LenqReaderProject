@@ -16,10 +16,13 @@ import {
 import { ArticleReader } from './ArticleReader';
 import { supabase, Edition } from '../lib/supabase';
 import { ensurePromiseWithResolvers } from '../utils/ensurePromiseWithResolvers';
+import { AdvancedReader } from '../reader/AdvancedReader';
+import { manifestService, preloadImage } from '../reader/services/manifestService';
+import type { ReaderManifest } from '../reader/types';
 
 ensurePromiseWithResolvers();
 
-interface ReaderAccessData {
+export interface ReaderAccessData {
  tokenId?: string;
  pdfId?: string;
  pdfUrl: string;
@@ -85,56 +88,6 @@ const formatEditionDateLabel = (isoDate?: string | null) => {
  } catch {
   return '';
  }
-};
-
-const ALLOWED_EDITION_STATUSES = new Set<Edition['statut'] | string>(['published', 'ready', 'processing']);
-
-const buildPdfPathCandidates = (rawPath: string | null | undefined) => {
- const result = new Set<string>();
- const trimmed = rawPath?.trim?.() ?? '';
- if (!trimmed) {
-  return { paths: [], fileName: null as string | null };
- }
-
- const withoutQuery = trimmed.split('?')[0];
- const decoded = (() => {
-  try {
-   return decodeURIComponent(withoutQuery);
-  } catch {
-   return withoutQuery;
-  }
- })();
-
- const pushCandidate = (candidate?: string | null) => {
-  const normalized = candidate?.trim();
-  if (normalized) {
-   result.add(normalized);
-  }
- };
-
- pushCandidate(trimmed);
- pushCandidate(withoutQuery);
- pushCandidate(decoded);
-
- const bucketMarker = '/secure-pdfs/';
- const legacyBucketMarker = 'secure-pdfs/';
-
- const extractAfterBucket = (value: string, marker: string) => {
-  const index = value.toLowerCase().indexOf(marker.toLowerCase());
-  if (index < 0) return null;
-  return value.slice(index + marker.length);
- };
-
- const afterBucket =
-  extractAfterBucket(decoded, bucketMarker) ?? extractAfterBucket(decoded, legacyBucketMarker);
-
- if (afterBucket) {
-  pushCandidate(afterBucket);
-  pushCandidate(`secure-pdfs/${afterBucket}`);
- }
-
- const fileName = decoded.split('/').pop() ?? null;
- return { paths: Array.from(result), fileName };
 };
 
 const PDF_JS_VERSION = '4.10.38';
@@ -236,6 +189,260 @@ const writeCachedAccessData = (token: string, payload: ReaderAccessData) => {
  }
 };
 
+interface RenderPlan {
+ page: number;
+ rotation: number;
+ scale: number;
+ containerWidth: number;
+ containerHeight: number;
+ pagesToRender: number[];
+}
+
+interface RenderTask {
+ pdfDocument: any;
+ canvas: HTMLCanvasElement;
+ plan: RenderPlan;
+ fingerprint: string;
+ applyWatermark: (
+  context: CanvasRenderingContext2D,
+  bounds: { width: number; height: number; offsetX: number },
+  pageNumber: number
+ ) => void;
+ devicePixelRatio: number;
+}
+
+class RenderQueue {
+ private currentPromise: Promise<void> | null = null;
+ private controller: AbortController | null = null;
+ private queuedTask: RenderTask | null = null;
+
+ constructor(
+  private readonly worker: (task: RenderTask, signal: AbortSignal) => Promise<void>,
+  private readonly handleComplete: (task: RenderTask) => void,
+  private readonly handleError: (error: unknown, task: RenderTask) => void
+ ) {}
+
+ enqueue(task: RenderTask) {
+  if (this.currentPromise) {
+   this.controller?.abort();
+   this.queuedTask = task;
+   return;
+  }
+
+  this.start(task);
+ }
+
+ cancel() {
+  this.controller?.abort();
+  this.queuedTask = null;
+  this.currentPromise = null;
+  this.controller = null;
+ }
+
+ private start(task: RenderTask) {
+  this.controller = new AbortController();
+  const { signal } = this.controller;
+
+  this.currentPromise = this.worker(task, signal)
+   .then(() => {
+    if (!signal.aborted) {
+     this.handleComplete(task);
+    }
+   })
+   .catch((error) => {
+    if ((error as DOMException)?.name === 'AbortError') {
+     return;
+    }
+    this.handleError(error, task);
+   })
+   .finally(() => {
+    this.currentPromise = null;
+    this.controller = null;
+    const next = this.queuedTask;
+    this.queuedTask = null;
+    if (next) {
+     this.start(next);
+    }
+  });
+ }
+}
+
+const createPlanFingerprint = (plan: RenderPlan) =>
+ `${plan.page}|${plan.rotation}|${plan.scale}|${plan.containerWidth}|${plan.containerHeight}|${plan.pagesToRender.join(',')}`;
+
+interface CachedRender {
+ bitmap: ImageBitmap;
+ width: number;
+ height: number;
+ cssWidth: number;
+ cssHeight: number;
+ devicePixelRatio: number;
+}
+
+class RenderCache {
+ private cache = new Map<string, CachedRender>();
+ constructor(private readonly maxEntries = 6) {}
+
+ get(key: string) {
+  const entry = this.cache.get(key);
+  if (!entry) {
+   return null;
+  }
+  this.cache.delete(key);
+  this.cache.set(key, entry);
+  return entry;
+ }
+
+ set(key: string, value: CachedRender) {
+  const existing = this.cache.get(key);
+  if (existing) {
+   existing.bitmap.close();
+   this.cache.delete(key);
+  }
+  this.cache.set(key, value);
+  this.enforceCapacity();
+ }
+
+ clear() {
+  for (const [, entry] of this.cache) {
+   entry.bitmap.close();
+  }
+  this.cache.clear();
+ }
+
+ private enforceCapacity() {
+  while (this.cache.size > this.maxEntries) {
+   const oldestKey = this.cache.keys().next().value;
+   if (!oldestKey) {
+    break;
+   }
+   const oldest = this.cache.get(oldestKey);
+   if (oldest) {
+    oldest.bitmap.close();
+   }
+   this.cache.delete(oldestKey);
+  }
+ }
+}
+
+const performRenderTask = async (task: RenderTask, signal: AbortSignal, cache?: RenderCache | null) => {
+ const { pdfDocument, canvas, plan, applyWatermark, devicePixelRatio } = task;
+
+ const pdfPages = await Promise.all(plan.pagesToRender.map((pageNumber) => pdfDocument.getPage(pageNumber)));
+ if (signal.aborted) {
+  throw new DOMException('Aborted', 'AbortError');
+ }
+
+ const baseViewports = pdfPages.map((page) =>
+  page.getViewport({ scale: 1, rotation: plan.rotation })
+ );
+ const totalBaseWidth = baseViewports.reduce((sum, viewport) => sum + viewport.width, 0);
+ const maxBaseHeight = baseViewports.reduce(
+  (max, viewport) => Math.max(max, viewport.height),
+  0
+ );
+
+ const baseScaleRaw = Math.min(
+  plan.containerWidth / totalBaseWidth,
+  plan.containerHeight / maxBaseHeight
+ );
+ const baseScale = Math.max(Math.min(baseScaleRaw, 1) * 0.98, 0.1);
+ const effectiveScale = baseScale * plan.scale;
+
+ const scaledViewports = pdfPages.map((page) =>
+  page.getViewport({ scale: effectiveScale, rotation: plan.rotation })
+ );
+ const totalWidth = scaledViewports.reduce((sum, viewport) => sum + viewport.width, 0);
+ const maxHeight = scaledViewports.reduce(
+  (current, viewport) => Math.max(current, viewport.height),
+  0
+ );
+
+ const context = canvas.getContext('2d');
+ if (!context) {
+  return;
+ }
+
+ const dpr = devicePixelRatio || 1;
+ canvas.width = Math.max(1, Math.round(totalWidth * dpr));
+ canvas.height = Math.max(1, Math.round(maxHeight * dpr));
+ canvas.style.width = `${totalWidth}px`;
+ canvas.style.height = `${maxHeight}px`;
+
+ context.setTransform(dpr, 0, 0, dpr, 0, 0);
+ context.clearRect(0, 0, totalWidth, maxHeight);
+
+ let offsetX = 0;
+
+ for (let index = 0; index < pdfPages.length; index += 1) {
+  if (signal.aborted) {
+   throw new DOMException('Aborted', 'AbortError');
+  }
+
+  const page = pdfPages[index];
+  const viewport = scaledViewports[index];
+
+  context.save();
+  context.translate(offsetX, 0);
+
+  const renderTask = page.render({
+   canvasContext: context,
+   viewport,
+  });
+
+  await new Promise<void>((resolve, reject) => {
+   const abort = () => {
+    renderTask.cancel();
+    reject(new DOMException('Aborted', 'AbortError'));
+   };
+
+   if (signal.aborted) {
+    abort();
+    return;
+   }
+
+   const listener = () => abort();
+   signal.addEventListener('abort', listener);
+
+   renderTask.promise
+    .then(() => {
+     signal.removeEventListener('abort', listener);
+     resolve();
+    })
+    .catch((error: unknown) => {
+     signal.removeEventListener('abort', listener);
+     reject(error);
+    });
+  });
+
+  context.restore();
+
+  applyWatermark(context, { width: viewport.width, height: viewport.height, offsetX }, plan.pagesToRender[index]);
+
+  offsetX += viewport.width;
+ }
+
+ if (signal.aborted) {
+  throw new DOMException('Aborted', 'AbortError');
+ }
+
+ if (cache && typeof createImageBitmap === 'function') {
+  try {
+   const bitmap = await createImageBitmap(canvas);
+   cache.set(task.fingerprint, {
+    bitmap,
+    width: canvas.width,
+    height: canvas.height,
+    cssWidth: totalWidth,
+    cssHeight: maxHeight,
+    devicePixelRatio: dpr,
+   });
+  } catch (bitmapError) {
+   console.warn('Erreur lors de la mise en cache du rendu PDF', bitmapError);
+  }
+ }
+};
+
 export function ModernPDFReader({ token, initialData }: ModernPDFReaderProps) {
  const [loading, setLoading] = useState(true);
  const [error, setError] = useState('');
@@ -250,8 +457,6 @@ export function ModernPDFReader({ token, initialData }: ModernPDFReaderProps) {
  const [rotation, setRotation] = useState(0);
  const [isFullscreen, setIsFullscreen] = useState(false);
  const [sessionId, setSessionId] = useState('');
- const isRenderingRef = useRef(false);
- const pendingRenderRef = useRef<{ page: number; rotation: number; scale: number } | null>(null);
  const [pdfReady, setPdfReady] = useState(false);
 const [isSpreadMode, setIsSpreadMode] = useState(true);
  const [tocOpen, setTocOpen] = useState(false);
@@ -260,6 +465,9 @@ const [isSpreadMode, setIsSpreadMode] = useState(true);
  const [initialArticleId, setInitialArticleId] = useState<string | null>(null);
  const [pendingArticleId, setPendingArticleId] = useState<string | null>(null);
  const [editionInfo, setEditionInfo] = useState<EditionSummary | null>(null);
+ const [readerManifest, setReaderManifest] = useState<ReaderManifest | null>(null);
+ const [manifestLoading, setManifestLoading] = useState(false);
+ const [manifestError, setManifestError] = useState<string | null>(null);
  const lastHotspotEditionRef = useRef<string | null>(null);
 
  const firstArticleId = useMemo(() => {
@@ -275,6 +483,64 @@ const [isSpreadMode, setIsSpreadMode] = useState(true);
   }
   return null;
  }, [articleHotspots]);
+
+const fetchEditionMetadata = useCallback(async (incomingEditionId: string | null, pdfUrl: string) => {
+  if (incomingEditionId) {
+    setEditionId(incomingEditionId);
+    return incomingEditionId;
+  }
+
+  const fileName = pdfUrl?.split('/').pop()?.split('?')[0]?.trim();
+  if (!fileName) {
+    setEditionId(null);
+    setEditionInfo(null);
+    return null;
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('editions')
+      .select('id, titre, date_publication, date_edition')
+      .ilike('pdf_url', `%${fileName}%`)
+      .order('updated_at', { ascending: false })
+      .limit(1);
+
+    if (error || !data || data.length === 0) {
+      setEditionId(null);
+      setEditionInfo(null);
+      return null;
+    }
+
+    const edition = data[0];
+    setEditionId(edition.id);
+    setEditionInfo({
+      id: edition.id,
+      titre: edition.titre,
+      date_publication: edition.date_publication,
+      date_edition: edition.date_edition,
+    });
+    return edition.id as string;
+  } catch (err) {
+    console.error('Error fetching edition metadata:', err);
+    setEditionId(incomingEditionId ?? null);
+    return incomingEditionId;
+  }
+}, []);
+
+const fetchIpAddress = useCallback(async (): Promise<string | undefined> => {
+  try {
+    const response = await fetch('https://api.ipify.org?format=json', {
+      signal: AbortSignal.timeout(2500),
+    });
+    if (!response.ok) {
+      return undefined;
+    }
+    const payload = (await response.json()) as { ip?: string };
+    return payload.ip || undefined;
+  } catch {
+    return undefined;
+  }
+}, []);
 
  const articlePageMap = useMemo(() => {
   const map = new Map<string, number>();
@@ -295,20 +561,19 @@ const [isSpreadMode, setIsSpreadMode] = useState(true);
   return editionInfo?.titre || '';
  }, [editionInfo]);
 
- const containerRef = useRef<HTMLDivElement>(null);
- const canvasRef = useRef<HTMLCanvasElement>(null);
+const containerRef = useRef<HTMLDivElement>(null);
+const canvasRef = useRef<HTMLCanvasElement>(null);
+const pdfDocumentRef = useRef<any | null>(null);
+const renderQueueRef = useRef<RenderQueue | null>(null);
+const renderCacheRef = useRef<RenderCache | null>(null);
+const pendingRenderRequestRef = useRef<{ page: number; rotation: number; scale: number } | null>(null);
+const lastRenderFingerprintRef = useRef<string | null>(null);
+const hotspotRequestControllerRef = useRef<AbortController | null>(null);
+const manifestControllerRef = useRef<AbortController | null>(null);
 const touchStartRef = useRef({ x: 0, y: 0, distance: 0, time: 0 });
 const scaleRef = useRef(1);
 const rotationRef = useRef(0);
 const currentPageRef = useRef(1);
-const lastRenderRef = useRef<{
- page: number;
- rotation: number;
- scale: number;
- containerWidth: number;
- containerHeight: number;
- spread: number;
-} | null>(null);
 const isBrowser = typeof window !== 'undefined';
 const [viewportWidth, setViewportWidth] = useState(() =>
  isBrowser ? window.innerWidth : 1024
@@ -474,200 +739,8 @@ useEffect(() => {
   };
  }, []);
 
-const resolvePdfUrl = useCallback(async (storagePath: string) => {
-  const trimmedPath = storagePath?.trim?.() ?? '';
-  if (!trimmedPath) {
-   throw new Error('Chemin du PDF invalide');
-  }
-
-  try {
-   const { data, error } = await supabase.storage
-    .from('secure-pdfs')
-    .createSignedUrl(trimmedPath, 60 * 60);
-
-   if (!error && data?.signedUrl) {
-    return data.signedUrl;
-   }
-
-   if (error) {
-    console.warn('Echec de generation de l URL signee, tentative de fallback', error);
-   }
-  } catch (err) {
-   console.warn('Echec de generation de l URL signee, tentative de fallback', err);
-  }
-
-  const { data: publicData } = supabase.storage
-   .from('secure-pdfs')
-   .getPublicUrl(trimmedPath);
-
-  if (publicData?.publicUrl) {
-   return publicData.publicUrl;
-  }
-
-  if (/^https?:\/\//i.test(trimmedPath)) {
-   return trimmedPath;
-  }
-
- throw new Error('Impossible de generer une URL pour le PDF demande');
-}, []);
-
-const fetchIpAddress = useCallback(async () => {
- if (typeof fetch === 'undefined') return '';
-
- const supportsAbort = typeof AbortController !== 'undefined';
- const controller = supportsAbort ? new AbortController() : null;
- let timeoutId: ReturnType<typeof setTimeout> | undefined;
-
- try {
-  if (supportsAbort) {
-   timeoutId = setTimeout(() => {
-    try {
-     controller?.abort();
-    } catch {
-     /* ignore abort errors */
-    }
-   }, 4000);
-  }
-
-  const response = await fetch('https://api.ipify.org?format=json', {
-   signal: controller?.signal,
-  });
-
-  if (!response.ok) {
-   return '';
-  }
-
-  const result = await response.json();
-  return result?.ip ?? '';
- } catch (ipErr) {
-  if (ipErr instanceof DOMException && ipErr.name === 'AbortError') {
-   console.warn('Recuperation de l adresse IP interrompue (timeout)');
-  } else {
-   console.warn('Impossible de recuperer l adresse IP', ipErr);
-  }
-  return '';
- } finally {
-  if (timeoutId) {
-   clearTimeout(timeoutId);
-  }
- }
-}, []);
-
-const fetchEditionMetadata = useCallback(
-async (editionIdCandidate: string | null | undefined, pdfPath: string) => {
-  const applyEditionRecord = (record: {
-   id: string;
-   titre: string;
-   date_publication: string | null;
-   date_edition: string | null;
-   statut?: Edition['statut'] | string | null;
-  } | null) => {
-   if (!record) return null;
-
-   if (record.statut && !ALLOWED_EDITION_STATUSES.has(record.statut)) {
-    console.warn(
-     'Edition chargee avec un statut hors liste autorisee',
-     { editionId: record.id, statut: record.statut }
-    );
-   }
-
-   setEditionId(record.id);
-   setEditionInfo({
-    id: record.id,
-    titre: record.titre,
-    date_publication: record.date_publication,
-    date_edition: record.date_edition,
-   });
-   return record.id;
-  };
-
-  const tryFetchByPdfPaths = async (
-   paths: string[],
-   restrictStatus: boolean
-  ) => {
-   if (!paths.length) return null;
-
-   let query = supabase
-    .from('editions')
-    .select('id, titre, date_publication, date_edition, statut, pdf_url, updated_at')
-    .in('pdf_url', paths)
-    .order('updated_at', { ascending: false });
-
-   if (restrictStatus) {
-    query = query.in('statut', Array.from(ALLOWED_EDITION_STATUSES));
-   }
-
-   const { data, error } = await query.limit(10);
-   if (error || !Array.isArray(data) || data.length === 0) {
-    return null;
-   }
-
-   for (const record of data) {
-    const appliedId = applyEditionRecord(record);
-    if (appliedId) {
-     return appliedId;
-    }
-   }
-   return null;
-  };
-
-  try {
-   if (editionIdCandidate) {
-    const { data, error } = await supabase
-     .from('editions')
-     .select('id, titre, date_publication, date_edition, statut, pdf_url')
-      .eq('id', editionIdCandidate)
-      .maybeSingle();
-
-     if (!error && data) {
-      const appliedId = applyEditionRecord(data);
-     if (appliedId) {
-      return appliedId;
-     }
-    }
-   }
-
-   const { paths: pdfPathCandidates, fileName } = buildPdfPathCandidates(pdfPath);
-
-   const allowedStatusMatch = await tryFetchByPdfPaths(pdfPathCandidates, true);
-   if (allowedStatusMatch) {
-    return allowedStatusMatch;
-   }
-
-   const relaxedStatusMatch = await tryFetchByPdfPaths(pdfPathCandidates, false);
-   if (relaxedStatusMatch) {
-    return relaxedStatusMatch;
-   }
-
-   if (fileName) {
-    const { data: editionByName, error: editionByNameError } = await supabase
-     .from('editions')
-     .select('id, titre, date_publication, date_edition, statut, pdf_url, updated_at')
-     .ilike('pdf_url', `%${fileName}%`)
-     .order('updated_at', { ascending: false })
-     .limit(10);
-
-    if (!editionByNameError && Array.isArray(editionByName) && editionByName.length > 0) {
-     for (const record of editionByName) {
-      const appliedId = applyEditionRecord(record);
-      if (appliedId) {
-       return appliedId;
-      }
-     }
-    }
-   }
-  } catch (err) {
-   console.error('Error fetching edition metadata:', err);
-  }
-
-  setEditionId(editionIdCandidate ?? null);
-   setEditionInfo(null);
-   return editionIdCandidate ?? null;
-  },
-  []
- );
-
- const loadArticleHotspots = useCallback(async (targetEditionId: string) => {
+const loadArticleHotspots = useCallback(
+ async (targetEditionId: string, signal?: AbortSignal) => {
   if (!targetEditionId) {
    setArticleHotspots({});
    setHasArticles(false);
@@ -693,6 +766,10 @@ async (editionIdCandidate: string | null | undefined, pdfPath: string) => {
 
    if (error) {
     throw error;
+   }
+
+   if (signal?.aborted) {
+    return;
    }
 
    const articlesData: Array<{
@@ -721,6 +798,10 @@ async (editionIdCandidate: string | null | undefined, pdfPath: string) => {
      .select('id, page_number')
      .in('id', uniquePageIds);
 
+    if (signal?.aborted) {
+     return;
+    }
+
     if (pagesError) {
      console.warn('Impossible de charger les numeros de page pour les hotspots', pagesError);
     } else if (Array.isArray(pagesData)) {
@@ -732,11 +813,15 @@ async (editionIdCandidate: string | null | undefined, pdfPath: string) => {
     }
    }
 
+   if (signal?.aborted) {
+    return;
+   }
+
    const hotspotsMap: Record<number, ArticleHotspot[]> = {};
    const ignoredHotspots: string[] = [];
 
    articlesData.forEach((article) => {
-    if (!article) return;
+    if (!article || signal?.aborted) return;
 
     const normalizedWidth = clamp01(article.width);
     const normalizedHeight = clamp01(article.height);
@@ -771,6 +856,10 @@ async (editionIdCandidate: string | null | undefined, pdfPath: string) => {
     hotspotsMap[safePageNumber].push(hotspot);
    });
 
+   if (signal?.aborted) {
+    return;
+   }
+
    Object.values(hotspotsMap).forEach((list) => list.sort((a, b) => a.ordre - b.ordre));
 
    if (ignoredHotspots.length > 0) {
@@ -785,17 +874,66 @@ async (editionIdCandidate: string | null | undefined, pdfPath: string) => {
    setArticleHotspots(hasValidHotspots ? hotspotsMap : {});
    setHasArticles(articlesData.length > 0);
   } catch (err) {
+   if ((err as DOMException)?.name === 'AbortError' || signal?.aborted) {
+    return;
+   }
    console.error('Error loading article hotspots:', err);
    setArticleHotspots({});
    setHasArticles(false);
   } finally {
-   setCheckingArticles(false);
+   if (!signal?.aborted) {
+    setCheckingArticles(false);
+   }
   }
- }, []);
+ },
+ []
+);
 
- const applyAccessData = useCallback(
-  async (payload: ReaderAccessData) => {
-   const metadataPromise = fetchEditionMetadata(payload.editionId ?? null, payload.pdfUrl);
+const requestHotspotsForEdition = useCallback(
+ (targetEditionId: string | null) => {
+  const currentController = hotspotRequestControllerRef.current;
+  if (currentController) {
+   currentController.abort();
+   hotspotRequestControllerRef.current = null;
+  }
+
+  if (!targetEditionId) {
+   setArticleHotspots({});
+   setHasArticles(false);
+   setCheckingArticles(false);
+   return;
+  }
+
+  const controller = new AbortController();
+  hotspotRequestControllerRef.current = controller;
+
+  loadArticleHotspots(targetEditionId, controller.signal)
+   .then(() => {
+    if (!controller.signal.aborted) {
+     lastHotspotEditionRef.current = targetEditionId;
+    }
+   })
+   .catch((err) => {
+    if (controller.signal.aborted) {
+     return;
+    }
+    console.error('Erreur lors du rafraichissement des hotspots', err);
+   })
+   .finally(() => {
+    if (hotspotRequestControllerRef.current === controller) {
+     hotspotRequestControllerRef.current = null;
+    }
+    if (controller.signal.aborted) {
+     setCheckingArticles(false);
+    }
+   });
+ },
+ [loadArticleHotspots]
+);
+
+const applyAccessData = useCallback(
+ async (payload: ReaderAccessData) => {
+  const metadataPromise = fetchEditionMetadata(payload.editionId ?? null, payload.pdfUrl);
 
    const tokenRecord: TokenData = {
     id: payload.tokenId ?? '',
@@ -830,20 +968,18 @@ async (editionIdCandidate: string | null | undefined, pdfPath: string) => {
      }
 
      if (editionIdResolved) {
-      if (payload.hasArticles !== false) {
-       try {
-        await loadArticleHotspots(editionIdResolved);
-       } catch (err) {
-        console.error('Erreur lors du chargement des hotspots (deferred)', err);
-        setArticleHotspots({});
-       }
-      } else {
+      lastHotspotEditionRef.current = null;
+      if (payload.hasArticles === false) {
        setArticleHotspots({});
+       setHasArticles(false);
+      } else {
+       setHasArticles(true);
       }
-     } else {
-      setArticleHotspots({});
-      setHasArticles(payload.hasArticles ?? false);
+      return;
      }
+
+     setArticleHotspots({});
+     setHasArticles(payload.hasArticles ?? false);
     })
     .catch((err) => {
      console.error('Error resolving edition metadata (deferred)', err);
@@ -852,9 +988,9 @@ async (editionIdCandidate: string | null | undefined, pdfPath: string) => {
       setHasArticles(false);
      }
     });
-  },
-  [fetchEditionMetadata, loadArticleHotspots]
- );
+ },
+ [fetchEditionMetadata]
+);
 
  const validateToken = useCallback(async () => {
   if (!token) {
@@ -911,12 +1047,14 @@ async (editionIdCandidate: string | null | undefined, pdfPath: string) => {
     }),
    ]).then((value) => value ?? '');
 
-   const response = await fetch(
+  const response = await fetch(
     `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/validate-edition-access`,
     {
      method: 'POST',
      headers: {
       'Content-Type': 'application/json',
+      Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+      apikey: import.meta.env.VITE_SUPABASE_ANON_KEY,
      },
      body: JSON.stringify({
       token,
@@ -1129,6 +1267,10 @@ const applyWatermark = useCallback(
  },
  [sessionId, tokenData]
 );
+const applyWatermarkRef = useRef(applyWatermark);
+useEffect(() => {
+ applyWatermarkRef.current = applyWatermark;
+}, [applyWatermark]);
 useEffect(() => {
  scaleRef.current = scale;
 }, [scale]);
@@ -1137,136 +1279,144 @@ useEffect(() => {
  rotationRef.current = rotation;
 }, [rotation]);
 
-const renderPage = useCallback(
- async (pageNumber: number, renderRotation: number, renderScale: number) => {
-  const pdf = (window as any).pdfDocument;
-  if (!pdf) return;
-
-  const canvas = canvasRef.current;
-  if (!canvas) {
-   pendingRenderRef.current = { page: pageNumber, rotation: renderRotation, scale: renderScale };
-   return;
-  }
-
-  const containerWidth =
-   containerRef.current?.clientWidth ?? Math.max(320, viewportWidth - 32);
-  const containerHeight = Math.max(
-   200,
-   viewportHeight - (isMobile ? 220 : isTablet ? 220 : 260)
-  );
-  const pagesToRender: number[] = [pageNumber];
-  if (isSpreadMode && shouldRenderSecondPage(pageNumber)) {
-   pagesToRender.push(pageNumber + 1);
-  }
-
-  const lastRender = lastRenderRef.current;
-
-  if (
-   lastRender &&
-   lastRender.page === pageNumber &&
-   lastRender.rotation === renderRotation &&
-   lastRender.scale === renderScale &&
-   lastRender.containerWidth === containerWidth &&
-   lastRender.containerHeight === containerHeight &&
-   lastRender.spread === pagesToRender.length
-  ) {
-   return;
-  }
-
-  if (isRenderingRef.current) {
-   pendingRenderRef.current = { page: pageNumber, rotation: renderRotation, scale: renderScale };
-   return;
-  }
-
-  isRenderingRef.current = true;
-
-  try {
-   const pdfPages = await Promise.all(pagesToRender.map((num) => pdf.getPage(num)));
-   const context = canvas.getContext('2d');
-   if (!context) {
-    isRenderingRef.current = false;
-    return;
+const createRenderPlan = useMemo(
+ () =>
+  (pageNumber: number, renderRotation: number, renderScale: number): RenderPlan | null => {
+   if (!totalPages) {
+    return null;
    }
 
-   const baseViewports = pdfPages.map((page) =>
-    page.getViewport({ scale: 1, rotation: renderRotation })
-   );
-   const totalBaseWidth = baseViewports.reduce((sum, viewport) => sum + viewport.width, 0);
-   const maxBaseHeight = baseViewports.reduce(
-    (max, viewport) => Math.max(max, viewport.height),
-    0
-   );
-
-   const baseScaleRaw = Math.min(
-    containerWidth / totalBaseWidth,
-    containerHeight / maxBaseHeight
+   const normalizedPage = clampPage(pageNumber);
+   const containerWidth =
+    containerRef.current?.clientWidth ?? Math.max(320, viewportWidth - 32);
+   const containerHeight = Math.max(
+    200,
+    viewportHeight - (isMobile ? 220 : isTablet ? 220 : 260)
    );
 
-   const baseScale = Math.max(Math.min(baseScaleRaw, 1) * 0.98, 0.1);
-   const effectiveScale = baseScale * renderScale;
-
-   const scaledViewports = pdfPages.map((page) =>
-    page.getViewport({ scale: effectiveScale, rotation: renderRotation })
-   );
-
-   const totalWidth = scaledViewports.reduce((sum, viewport) => sum + viewport.width, 0);
-   const maxHeight = scaledViewports.reduce((max, viewport) => Math.max(max, viewport.height), 0);
-
-   const dpr = window.devicePixelRatio || 1;
-   canvas.width = Math.max(1, Math.round(totalWidth * dpr));
-   canvas.height = Math.max(1, Math.round(maxHeight * dpr));
-   canvas.style.width = `${totalWidth}px`;
-   canvas.style.height = `${maxHeight}px`;
-
-   context.setTransform(dpr, 0, 0, dpr, 0, 0);
-   context.clearRect(0, 0, totalWidth, maxHeight);
-
-   let offsetX = 0;
-
-   for (let index = 0; index < pdfPages.length; index += 1) {
-    const page = pdfPages[index];
-    const viewport = scaledViewports[index];
-
-    context.save();
-    context.translate(offsetX, 0);
-    await page.render({
-     canvasContext: context,
-     viewport,
-    }).promise;
-    context.restore();
-
-    applyWatermark(context, { width: viewport.width, height: viewport.height, offsetX }, pagesToRender[index]);
-
-    offsetX += viewport.width;
+   const pagesToRender: number[] = [normalizedPage];
+   if (isSpreadMode && shouldRenderSecondPage(normalizedPage)) {
+    const secondaryPage = Math.min(totalPages, normalizedPage + 1);
+    if (!pagesToRender.includes(secondaryPage)) {
+     pagesToRender.push(secondaryPage);
+    }
    }
 
-   lastRenderRef.current = {
-    page: pageNumber,
+   const validPages = pagesToRender.filter((page) => page >= 1 && page <= totalPages);
+   if (validPages.length === 0) {
+    return null;
+   }
+
+   return {
+    page: normalizedPage,
     rotation: renderRotation,
     scale: renderScale,
     containerWidth,
     containerHeight,
-    spread: pagesToRender.length,
+    pagesToRender: validPages,
    };
-   setPdfReady(true);
-  } catch (err) {
-   console.error('Error rendering page:', err);
-  } finally {
-   isRenderingRef.current = false;
+  },
+ [clampPage, isMobile, isSpreadMode, isTablet, shouldRenderSecondPage, totalPages, viewportHeight, viewportWidth]
+);
 
-   if (pendingRenderRef.current) {
-    const next = pendingRenderRef.current;
-    pendingRenderRef.current = null;
-    await renderPage(next.page, next.rotation, next.scale);
+const ensureRenderQueue = useCallback(() => {
+ if (!renderQueueRef.current) {
+  if (!renderCacheRef.current) {
+   renderCacheRef.current = new RenderCache();
+  }
+  renderQueueRef.current = new RenderQueue(
+   (task, signal) => performRenderTask(task, signal, renderCacheRef.current),
+   (completedTask) => {
+    lastRenderFingerprintRef.current = completedTask.fingerprint;
+    setPdfReady(true);
+   },
+   (error) => {
+    console.error('Error rendering page:', error);
+   }
+  );
+ }
+ return renderQueueRef.current!;
+}, [setPdfReady]);
+
+const renderPage = useCallback(
+ (pageNumber: number, renderRotation: number, renderScale: number) => {
+  const pdfDocument = pdfDocumentRef.current;
+  const canvas = canvasRef.current;
+
+  if (!pdfDocument || !canvas) {
+   pendingRenderRequestRef.current = { page: pageNumber, rotation: renderRotation, scale: renderScale };
+   return;
+  }
+
+  const plan = createRenderPlan(pageNumber, renderRotation, renderScale);
+  if (!plan) {
+   pendingRenderRequestRef.current = { page: pageNumber, rotation: renderRotation, scale: renderScale };
+   return;
+  }
+
+  if (!renderCacheRef.current) {
+   renderCacheRef.current = new RenderCache();
+  }
+
+  const fingerprint = createPlanFingerprint(plan);
+  if (lastRenderFingerprintRef.current === fingerprint) {
+   return;
+  }
+
+  const currentDpr = window.devicePixelRatio || 1;
+  const cachedRender = renderCacheRef.current.get(fingerprint);
+  if (cachedRender && Math.abs(cachedRender.devicePixelRatio - currentDpr) < 0.05) {
+   const context = canvas.getContext('2d');
+   if (context) {
+    canvas.width = cachedRender.width;
+    canvas.height = cachedRender.height;
+    canvas.style.width = `${cachedRender.cssWidth}px`;
+    canvas.style.height = `${cachedRender.cssHeight}px`;
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.clearRect(0, 0, cachedRender.width, cachedRender.height);
+    context.drawImage(cachedRender.bitmap, 0, 0);
+    lastRenderFingerprintRef.current = fingerprint;
+    setPdfReady(true);
+    return;
    }
   }
+
+  pendingRenderRequestRef.current = null;
+
+  const queue = ensureRenderQueue();
+  queue.enqueue({
+   pdfDocument,
+   canvas,
+   plan,
+   fingerprint,
+   applyWatermark: applyWatermarkRef.current,
+   devicePixelRatio: currentDpr,
+  });
  },
- [applyWatermark, isMobile, isSpreadMode, shouldRenderSecondPage, totalPages, viewportHeight, viewportWidth, isTablet]
+ [createRenderPlan, ensureRenderQueue, setPdfReady]
 );
-const latestRenderPageRef = useRef(renderPage);
+
 useEffect(() => {
- latestRenderPageRef.current = renderPage;
+ if (!pdfDocumentRef.current || !canvasRef.current) return;
+ const pending = pendingRenderRequestRef.current;
+ if (!pending) return;
+ pendingRenderRequestRef.current = null;
+ renderPage(pending.page, pending.rotation, pending.scale);
 }, [renderPage]);
+
+useEffect(() => () => {
+ renderQueueRef.current?.cancel();
+ renderCacheRef.current?.clear();
+ hotspotRequestControllerRef.current?.abort();
+ manifestControllerRef.current?.abort();
+ const doc = pdfDocumentRef.current;
+ pdfDocumentRef.current = null;
+ if (doc?.destroy) {
+  Promise.resolve()
+   .then(() => doc.destroy())
+   .catch(() => undefined);
+ }
+}, []);
 
 useEffect(() => {
  if (!pdfUrl) return;
@@ -1277,9 +1427,9 @@ useEffect(() => {
   try {
    await ensurePdfJsLib();
 
-   if ((window as any).pdfDocument?.destroy) {
+   if (pdfDocumentRef.current?.destroy) {
     try {
-     await (window as any).pdfDocument.destroy();
+     await pdfDocumentRef.current.destroy();
     } catch (destroyErr) {
      console.warn('Error while destroying previous PDF instance', destroyErr);
     }
@@ -1297,35 +1447,37 @@ useEffect(() => {
     return;
    }
 
-  (window as any).pdfDocument = pdf;
-  setTotalPages(pdf.numPages);
-  setCurrentPageState(1);
-  currentPageRef.current = 1;
-  lastRenderRef.current = null;
-  setPdfReady(false);
-  await latestRenderPageRef.current(1, rotationRef.current, scaleRef.current);
- } catch (err) {
+   renderQueueRef.current?.cancel();
+   renderCacheRef.current?.clear();
+   pdfDocumentRef.current = pdf;
+   setTotalPages(pdf.numPages);
+   setCurrentPageState(1);
+   currentPageRef.current = 1;
+   lastRenderFingerprintRef.current = null;
+   setPdfReady(false);
+   renderPage(1, rotationRef.current, scaleRef.current);
+  } catch (err) {
    if (!cancelled) {
     console.error('Error loading PDF:', err);
     let detail = '';
     if (err instanceof Error) {
-      detail = err.message;
+     detail = err.message;
     } else if (err && typeof err === 'object' && 'message' in err) {
-      detail = String((err as any).message);
+     detail = String((err as any).message);
     } else if (typeof err === 'string') {
-      detail = err;
+     detail = err;
     } else {
-      try {
-        detail = JSON.stringify(err);
-      } catch {
-        detail = String(err);
-      }
+     try {
+      detail = JSON.stringify(err);
+     } catch {
+      detail = String(err);
+     }
     }
 
     setError(
-      detail
-        ? `Erreur lors du chargement du PDF : ${detail}`
-        : 'Erreur lors du chargement du PDF'
+     detail
+      ? `Erreur lors du chargement du PDF : ${detail}`
+      : 'Erreur lors du chargement du PDF'
     );
    }
   }
@@ -1340,7 +1492,7 @@ useEffect(() => {
  return () => {
   cancelled = true;
  };
-}, [pdfUrl]);
+}, [pdfUrl, renderPage]);
 
 useEffect(() => {
  if (!pdfUrl || viewMode !== 'pdf' || loading) return;
@@ -1348,30 +1500,31 @@ useEffect(() => {
 }, [currentPage, loading, pdfUrl, renderPage, rotation, scale, viewMode]);
 
 useEffect(() => {
- if (loading || viewMode !== 'pdf') return;
- const pending = pendingRenderRef.current;
- if (!pending || !canvasRef.current) return;
+ if (!editionId) {
+  hotspotRequestControllerRef.current?.abort();
+  return () => {
+   hotspotRequestControllerRef.current?.abort();
+  };
+ }
 
- pendingRenderRef.current = null;
- renderPage(pending.page, pending.rotation, pending.scale);
-}, [loading, renderPage, viewMode]);
-useEffect(() => {
- if (!editionId || lastHotspotEditionRef.current === editionId) return;
+ if (!hasArticles) {
+  lastHotspotEditionRef.current = null;
+  requestHotspotsForEdition(null);
+  return () => {
+   hotspotRequestControllerRef.current?.abort();
+  };
+ }
 
-  loadArticleHotspots(editionId)
-    .then(() => {
-      lastHotspotEditionRef.current = editionId;
-    })
-    .catch(err => console.error('Erreur lors du rafraichissement des hotspots', err));
-}, [editionId, loadArticleHotspots]);
+ if (lastHotspotEditionRef.current === editionId && Object.keys(articleHotspots).length > 0) {
+  return;
+ }
 
+ requestHotspotsForEdition(editionId);
 
-useEffect(() => {
-  if (!editionId) return;
-  loadArticleHotspots(editionId).catch(err =>
-    console.error('Erreur lors du rafraichissement des hotspots', err)
-  );
-}, [editionId, loadArticleHotspots]);
+ return () => {
+  hotspotRequestControllerRef.current?.abort();
+ };
+}, [articleHotspots, editionId, hasArticles, requestHotspotsForEdition]);
 
 useEffect(() => {
   if (viewMode === 'article' && editionId && pendingArticleId && pendingArticleId !== initialArticleId) {
@@ -1379,6 +1532,57 @@ useEffect(() => {
     setPendingArticleId(null);
   }
 }, [viewMode, editionId, pendingArticleId, initialArticleId]);
+
+useEffect(() => {
+  if (!editionId || !tokenData || !token) {
+    manifestControllerRef.current?.abort();
+    setReaderManifest(null);
+    return;
+  }
+
+  manifestControllerRef.current?.abort();
+  const controller = new AbortController();
+  manifestControllerRef.current = controller;
+
+  setManifestLoading(true);
+  setManifestError(null);
+
+  manifestService
+    .fetchManifest({ token, editionId })
+    .then(async (manifest) => {
+      if (controller.signal.aborted) {
+        return;
+      }
+      setReaderManifest(manifest);
+      try {
+        await preloadImage(manifest.pages[0]?.lowResImageUrl);
+      } catch {
+        // ignore preload issues
+      }
+    })
+    .catch((err: unknown) => {
+      if (controller.signal.aborted) {
+        return;
+      }
+      const message =
+        err instanceof Error
+          ? err.message
+          : typeof err === 'string'
+          ? err
+          : 'Impossible de charger la liseuse';
+      setManifestError(message);
+      setReaderManifest(null);
+    })
+    .finally(() => {
+      if (!controller.signal.aborted) {
+        setManifestLoading(false);
+      }
+    });
+
+  return () => {
+    controller.abort();
+  };
+}, [editionId, token, tokenData]);
 
 useEffect(() => {
  if (viewMode !== 'pdf') {
@@ -1501,7 +1705,39 @@ const handleHotspotActivate = useCallback(
  [openArticleMode]
 );
 
- if (loading) {
+ if (!loading && readerManifest && tokenData && editionId) {
+  return (
+   <AdvancedReader
+    manifest={readerManifest}
+    token={token}
+    sessionId={sessionId}
+    onExit={handleExit}
+    accessData={{
+     userId: tokenData.user_id,
+     userName: tokenData.users?.nom ?? initialData?.userName,
+     userNumber: tokenData.users?.numero_abonne ?? initialData?.userNumber,
+     editionId,
+     editionTitle: editionInfo?.titre ?? readerManifest.edition.title,
+     pdfId: tokenData.pdf_id,
+    }}
+   />
+ );
+}
+
+ if (!loading && manifestLoading) {
+  return (
+   <div className="min-h-screen bg-[#f1f2f6] flex items-center justify-center">
+    <div className="flex flex-col items-center gap-4">
+     <div className="h-16 w-16 rounded-full border-4 border-[#d7deec] border-t-[#1f3b63] animate-spin" />
+     <p className="text-[#1f3b63] text-sm sm:text-base font-medium">
+      Préparation de la liseuse moderne...
+     </p>
+    </div>
+   </div>
+  );
+ }
+
+if (loading) {
   return (
    <div className="min-h-screen bg-[#f1f2f6] flex items-center justify-center">
     <div className="flex flex-col items-center gap-4">
@@ -1527,10 +1763,10 @@ const handleHotspotActivate = useCallback(
 const showArticle = viewMode === 'article';
 
 const articleView = (() => {
- if (!tokenData) {
-  return (
-   <div className="min-h-screen bg-[#f1f2f6] flex items-center justify-center">
-    <div className="text-[#1f3b63]">Chargement...</div>
+  if (!tokenData) {
+   return (
+    <div className="min-h-screen bg-[#f1f2f6] flex items-center justify-center">
+     <div className="text-[#1f3b63]">Chargement...</div>
    </div>
   );
  }
@@ -1546,8 +1782,8 @@ const articleView = (() => {
   );
  }
 
- return (
-  <ArticleReader
+  return (
+   <ArticleReader
    editionId={editionId}
    userId={tokenData.user_id}
    userName={tokenData.users?.nom || ''}
@@ -1586,7 +1822,18 @@ const articleView = (() => {
     onTouchMove={handleTouchMove}
     onTouchEnd={handleTouchEnd}
    >
-   <header className="fixed top-0 left-0 right-0 z-40 bg-[#ffffff] border-b border-[#dfe5f2] shadow-sm">
+    {manifestError && (
+     <div className="pointer-events-none fixed inset-x-0 top-20 z-50 flex justify-center px-4">
+      <div className="pointer-events-auto flex items-center gap-3 rounded-2xl border border-[#f8dada] bg-white px-4 py-3 shadow-lg text-sm text-[#b42318]">
+       <AlertCircle className="w-4 h-4" />
+       <span>
+        La liseuse moderne est indisponible pour cette edition ({manifestError}). Affichage du
+        mode classique.
+       </span>
+      </div>
+     </div>
+    )}
+    <header className="fixed top-0 left-0 right-0 z-40 bg-[#ffffff] border-b border-[#dfe5f2] shadow-sm">
     <div className="max-w-6xl mx-auto h-16 px-4 lg:px-6 flex items-center justify-between">
      <div className="flex items-center gap-4">
       <button
@@ -1708,7 +1955,7 @@ const articleView = (() => {
             handleHotspotActivate(event, hotspot);
            }
           }}
-          className="absolute border border-transparent bg-[#1f3b63]/0 hover:bg-[#1f3b63]/10 focus-visible:bg-[#1f3b63]/12 rounded-lg transition-colors duration-200"
+          className="absolute z-30 border border-transparent bg-[#1f3b63]/0 hover:bg-[#1f3b63]/10 focus-visible:bg-[#1f3b63]/12 rounded-lg transition-colors duration-200"
           style={{
            left: `${leftPercent}%`,
            top: `${clamp01(hotspot.y) * 100}%`,
@@ -1886,7 +2133,5 @@ const articleView = (() => {
 declare global {
  interface Window {
   pdfjsLib: any;
-  pdfDocument: any;
  }
 }
-

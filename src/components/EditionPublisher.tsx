@@ -299,8 +299,9 @@ function PublishModal({ pdf, activeSubscribers, onClose, onSuccess }: PublishMod
             {
               method: 'POST',
               headers: {
-                'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
                 'Content-Type': 'application/json',
+                Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+                apikey: import.meta.env.VITE_SUPABASE_ANON_KEY,
               },
               body: JSON.stringify({
                 to: subscriber.numero_whatsapp,

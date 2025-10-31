@@ -8,6 +8,7 @@ interface GenerateTokenPayload {
 
 interface UserProfile {
   id: string;
+  auth_user_id: string | null;
   statut_abonnement: string | null;
 }
 
@@ -94,11 +95,26 @@ Deno.serve(async (req: Request) => {
     }
 
     const authUserId = authUser.user.id;
+    const filters = [`auth_user_id.eq.${authUserId}`];
+    if (authUser.user.email) {
+      filters.unshift(`email.eq.${authUser.user.email}`);
+    }
+    const metadataPhone =
+      (authUser.user.user_metadata?.numero_whatsapp as string | undefined) ??
+      (authUser.user.phone as string | undefined) ??
+      null;
+    if (metadataPhone) {
+      const trimmed = metadataPhone.trim();
+      filters.push(`numero_whatsapp.eq.${trimmed}`);
+      if (trimmed.startsWith("+")) {
+        filters.push(`numero_whatsapp.eq.${trimmed.substring(1)}`);
+      }
+    }
 
     const { data: profile } = await serviceClient
       .from("users")
-      .select("id, statut_abonnement")
-      .eq("auth_user_id", authUserId)
+      .select("id, auth_user_id, statut_abonnement")
+      .or(filters.join(","))
       .maybeSingle<UserProfile>();
 
     if (!profile?.id) {

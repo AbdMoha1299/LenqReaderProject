@@ -34,7 +34,7 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const { data: tokenData, error: tokenError } = await supabaseClient
+    const { data: tokenByValue, error: tokenError } = await supabaseClient
       .from("tokens")
       .select("*")
       .eq("token", token)
@@ -46,6 +46,26 @@ Deno.serve(async (req: Request) => {
         JSON.stringify({ error: "Erreur de validation du token" }),
         { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
+    }
+
+    let tokenData = tokenByValue;
+
+    if (!tokenData) {
+      const { data: tokenById, error: tokenIdError } = await supabaseClient
+        .from("tokens")
+        .select("*")
+        .eq("id", token)
+        .maybeSingle();
+
+      if (tokenIdError) {
+        console.error("Token fallback query error:", tokenIdError);
+        return new Response(
+          JSON.stringify({ error: "Erreur de validation du token" }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      tokenData = tokenById;
     }
 
     if (!tokenData) {
@@ -170,8 +190,8 @@ Deno.serve(async (req: Request) => {
             user_id: tokenData.user_id,
             token_id: tokenData.id,
             type_alerte: "device_multiple",
-            description: `Tentative d'acces depuis un nouvel appareil non autorise. Appareils deja enregistres: ${fingerprintList.join(" || ")}`,
-            severity: "critical",
+            description: `Acces detecte depuis un nouvel appareil. Appareils deja observes: ${fingerprintList.join(" || ")}`,
+            severity: allowedDevices > 1 ? "high" : "critical",
             data: {
               authorized_devices: fingerprintList,
               new_device: deviceFingerprint,
@@ -179,24 +199,13 @@ Deno.serve(async (req: Request) => {
             },
           });
 
-          await supabaseClient
-            .from("tokens")
-            .update({
-              revoked: true,
-              revoked_reason: "Nombre maximum d'appareils atteint",
-            })
-            .eq("id", tokenData.id);
-
-          return new Response(
-            JSON.stringify({
-              error: "Acces refuse",
-              reason: "Ce lien a ete desactive car le nombre maximum d'appareils autorises a ete atteint.",
-            }),
-            { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-          );
+          const keepCount = Math.max(allowedDevices - 1, 0);
+          const trimmed = keepCount > 0 ? fingerprintList.slice(-keepCount) : [];
+          fingerprintList = [...trimmed, fingerprintJson];
+        } else {
+          fingerprintList.push(fingerprintJson);
         }
 
-        fingerprintList.push(fingerprintJson);
         fingerprintChanged = true;
       }
     }
@@ -257,7 +266,7 @@ Deno.serve(async (req: Request) => {
         articles(id, titre, ordre_lecture)
       `)
       .eq("pdf_url", pdfData.url_fichier)
-      .eq("statut", "published")
+      .in("statut", ["ready", "published"])
       .maybeSingle();
 
     const { data: signedUrlData, error: signedUrlError } = await supabaseClient.storage

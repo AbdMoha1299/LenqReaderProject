@@ -15,6 +15,7 @@ import {
   Award,
   Zap,
   BookOpen,
+  Loader2,
 } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
@@ -27,6 +28,7 @@ export function ReaderDashboard() {
   const [abonnement, setAbonnement] = useState<Abonnement | null>(null);
   const [editions, setEditions] = useState<PDF[]>([]);
   const [loading, setLoading] = useState(true);
+  const [readingEdition, setReadingEdition] = useState<string | null>(null);
 
   useEffect(() => {
     if (user) {
@@ -48,6 +50,53 @@ export function ReaderDashboard() {
       setUserData(data);
     } catch (error) {
       console.error('Error loading user data:', error);
+    }
+  };
+
+  const handleReadEdition = async (edition: PDF) => {
+    if (!user) {
+      alert("Vous devez être connecté pour accéder à l'édition.");
+      return;
+    }
+
+    setReadingEdition(edition.id);
+    try {
+      const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError) {
+        throw new Error(sessionError.message);
+      }
+      if (!session?.access_token) {
+        throw new Error("Session expirée. Veuillez vous reconnecter.");
+      }
+
+      const response = await fetch(
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/generate-reading-token`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${session.access_token}`,
+            apikey: import.meta.env.VITE_SUPABASE_ANON_KEY,
+          },
+          body: JSON.stringify({
+            pdfId: edition.id,
+            reuseExisting: true,
+          }),
+        }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok || !data.success) {
+        throw new Error(data.message || "Impossible de générer un accès sécurisé pour cette édition.");
+      }
+
+      navigate(`/read/${data.token}`);
+    } catch (error: any) {
+      console.error('Erreur génération lien de lecture:', error);
+      alert(error.message || "Erreur lors de la génération de l'accès. Veuillez réessayer.");
+    } finally {
+      setReadingEdition(null);
     }
   };
 
@@ -346,8 +395,19 @@ export function ReaderDashboard() {
                       <span>{formatDate(edition.date_publication_reelle)}</span>
                     </div>
                   </div>
-                  <button className="w-full px-4 py-3 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white font-bold rounded-xl transition-all duration-200 hover:scale-105 shadow-lg shadow-amber-500/20">
-                    Lire l'édition
+                  <button
+                    onClick={() => handleReadEdition(edition)}
+                    disabled={readingEdition === edition.id}
+                    className="w-full px-4 py-3 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white font-bold rounded-xl transition-all duration-200 hover:scale-105 shadow-lg shadow-amber-500/20 disabled:opacity-60 disabled:hover:scale-100 disabled:cursor-not-allowed"
+                  >
+                    {readingEdition === edition.id ? (
+                      <span className="flex items-center justify-center gap-2">
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Chargement...
+                      </span>
+                    ) : (
+                      "Lire l'édition"
+                    )}
                   </button>
                 </div>
               ))}

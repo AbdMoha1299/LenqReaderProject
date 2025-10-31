@@ -4,9 +4,11 @@ import { LogIn, Phone, Lock } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { formatPhoneNumber } from '../lib/otp';
 import { phoneToAuthEmail } from '../lib/subscriptionFlow';
+import { useAuth } from '../contexts/AuthContext';
 
 export function Login() {
   const navigate = useNavigate();
+  const { signIn: setAuthUser } = useAuth();
   const [phone, setPhone] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
@@ -26,17 +28,82 @@ export function Login() {
       const normalized = formatPhoneNumber(phone);
       const identifier = phoneToAuthEmail(normalized);
 
-      const { error: signInError } = await supabase.auth.signInWithPassword({
+      const {
+        data: authResult,
+        error: signInError,
+      } = await supabase.auth.signInWithPassword({
         email: identifier,
         password,
       });
 
-      if (signInError) {
-        setError(signInError.message || 'Connexion impossible. Vérifiez vos identifiants.');
+      if (signInError || !authResult.user) {
+        setError(signInError?.message || 'Connexion impossible. Vérifiez vos identifiants.');
         return;
       }
 
-      navigate('/reader');
+      const authUser = authResult.user;
+
+      const findProfile = async () => {
+        const direct = await supabase
+          .from('users')
+          .select('*')
+          .eq('auth_user_id', authUser.id)
+          .maybeSingle();
+
+        if (direct.error) {
+          throw direct.error;
+        }
+        if (direct.data) {
+          return direct.data;
+        }
+
+        const orFilters: string[] = [];
+        if (authUser.email) {
+          orFilters.push(`email.eq.${authUser.email}`);
+        }
+
+        const metaPhone =
+          (authUser.user_metadata?.numero_whatsapp as string | undefined) ??
+          (authUser.phone as string | undefined) ??
+          normalized;
+
+        if (metaPhone) {
+          const trimmed = metaPhone.trim();
+          orFilters.push(`numero_whatsapp.eq.${trimmed}`);
+          if (trimmed.startsWith('+')) {
+            orFilters.push(`numero_whatsapp.eq.${trimmed.substring(1)}`);
+          }
+        }
+
+        if (orFilters.length === 0) {
+          return null;
+        }
+
+        const fallback = await supabase
+          .from('users')
+          .select('*')
+          .or(orFilters.join(','))
+          .maybeSingle();
+
+        if (fallback.error) {
+          throw fallback.error;
+        }
+
+        return fallback.data;
+      };
+
+      const profile = await findProfile();
+
+      if (!profile) {
+        await supabase.auth.signOut();
+        setError(
+          "Profil utilisateur introuvable. Contactez le support pour finaliser la migration de votre compte."
+        );
+        return;
+      }
+
+      setAuthUser(profile as any);
+      navigate('/my-account');
     } catch (err: any) {
       console.error('Erreur connexion:', err);
       setError(err.message || 'Une erreur est survenue lors de la connexion.');
@@ -128,3 +195,4 @@ export function Login() {
     </div>
   );
 }
+

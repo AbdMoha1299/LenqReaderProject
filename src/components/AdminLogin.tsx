@@ -18,34 +18,59 @@ export function AdminLogin() {
     setLoading(true);
 
     try {
-      const { error: authError } = await supabase.auth.signInWithPassword({
+      const {
+        data: authData,
+        error: authError,
+      } = await supabase.auth.signInWithPassword({
         email,
         password,
       });
 
-      if (authError) throw authError;
-
-      const { data: userData, error: userError } = await supabase
-        .from('users')
-        .select('*')
-        .eq('email', email)
-        .maybeSingle();
-
-      if (userError || !userData) {
-        throw new Error('Utilisateur introuvable');
+      if (authError || !authData.user) {
+        throw authError;
       }
 
-      if (userData.role !== 'admin') {
+      const authUser = authData.user;
+
+      const fetchProfile = async () => {
+        const byAuthId = await supabase
+          .from('users')
+          .select('*')
+          .eq('auth_user_id', authUser.id)
+          .maybeSingle();
+
+        if (byAuthId.error) throw byAuthId.error;
+        if (byAuthId.data) return byAuthId.data;
+
+        const fallback = await supabase
+          .from('users')
+          .select('*')
+          .eq('email', email)
+          .maybeSingle();
+
+        if (fallback.error) throw fallback.error;
+        return fallback.data;
+      };
+
+      const profile = await fetchProfile();
+
+      if (!profile) {
+        await supabase.auth.signOut();
+        throw new Error("Profil administrateur introuvable. Vérifiez la configuration Supabase.");
+      }
+
+      if (profile.role !== 'admin') {
         await supabase.auth.signOut();
         setError('Accès réservé aux administrateurs');
         return;
       }
 
-      signIn(userData);
+      signIn(profile);
       navigate('/admin');
     } catch (err) {
-      console.error('Login error:', err);
-      setError(err instanceof Error ? err.message : 'Email ou mot de passe incorrect');
+      const errorMessage =
+        err instanceof Error ? err.message : 'Email ou mot de passe incorrect';
+      setError(errorMessage);
     } finally {
       setLoading(false);
     }
